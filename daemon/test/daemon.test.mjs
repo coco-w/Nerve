@@ -4,8 +4,11 @@ import { chmod, mkdtemp, rm, stat } from 'node:fs/promises';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { setTimeout as wait } from 'node:timers/promises';
 import { createAgentEvent, fromCodexHook } from '../dist/agent.js';
+import { startPushGateway } from '../dist/gateway/server.js';
 import { startDaemon } from '../dist/server.js';
 
 test('Codex 原生字段映射与 Zellij 关联', () => {
@@ -106,4 +109,112 @@ test('Unix Socket 校验来源映射、并发去重及 SQLite 重启恢复', { s
   const nextPage = (await http(socketPath, '/v1/events?after=' + page.nextCursor)).body;
   assert.deepEqual(nextPage.events.map(event => event.eventId), [older.eventId]);
   assert.equal(nextPage.nextCursor, 2);
+});
+
+async function until(check, context) {
+  const deadline = performance.now() + 8_000;
+  while (performance.now() < deadline) {
+    if (await check()) return;
+    await wait(50);
+  }
+  assert.fail(context);
+}
+
+function queueRows(file) {
+  const db = new DatabaseSync(file, { readOnly: true, timeout: 1000 });
+  try {
+    return db.prepare('SELECT payload, state, last_error FROM push_queue').all();
+  } finally {
+    db.close();
+  }
+}
+
+test('通知在 Gateway 离线时写入待投递队列，双方重启后仅投递筛选出的事件', {
+  skip: process.platform === 'win32',
+}, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nerve-push-test-'));
+  const daemonHome = join(root, 'daemon');
+  const directory = join(root, 'gateway');
+  const token = 'test-token-' + randomUUID();
+  let daemon;
+  let gateway;
+  t.after(async () => {
+    if (daemon?.server.listening) await close(daemon.server);
+    if (gateway?.listening) await close(gateway);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  gateway = await startPushGateway({ directory, port: 0, token });
+  const port = gateway.address().port;
+  await close(gateway);
+  const url = new URL('http://127.0.0.1:' + port + '/v1/notifications');
+
+  const event = (agent, nativeEvent) => createAgentEvent(agent, nativeEvent, 'private-session-id', '/private/work',
+    undefined, { ZELLIJ_SESSION_NAME: 'private-project', ZELLIJ_PANE_ID: '51' });
+  // 从旧库启用推送时只入队新事件，历史 Stop 仍可正常查询。
+  const previous = event('codex', 'Stop');
+  daemon = await startDaemon(daemonHome);
+  assert.equal((await http(daemon.socketPath, '/v1/events', JSON.stringify(previous))).status, 201);
+  await close(daemon.server);
+
+  const pushTarget = { url, token };
+  daemon = await startDaemon(daemonHome, pushTarget);
+  const selected = [event('codex', 'PermissionRequest'), event('codex', 'Stop'), event('omp', 'agent_end')];
+  const ignored = event('omp', 'agent_start');
+  for (const input of [ignored, ...selected, selected[0]]) {
+    const response = await http(daemon.socketPath, '/v1/events', JSON.stringify(input));
+    assert.equal(response.status, response.body.inserted ? 201 : 200);
+  }
+  const daemonDb = join(daemonHome, 'events.sqlite');
+  await until(() => {
+    const rows = queueRows(daemonDb);
+    return rows.length === selected.length && rows.every(row => row.state === 'pending' && row.last_error);
+  }, 'Gateway 离线时所有待投递通知应留在 SQLite');
+  await close(daemon.server);
+
+  const options = { directory, port, token };
+  gateway = await startPushGateway(options);
+  daemon = await startDaemon(daemonHome, pushTarget);
+  const gatewayDb = join(directory, 'notifications.sqlite');
+  const gatewayStatus = new URL('/v1/status', url);
+  // 重启时用新连接查询，测试进程的连接池可能还保留旧服务的空闲连接。
+  const headers = { authorization: 'Bearer ' + token, 'content-type': 'application/json', connection: 'close' };
+  assert.equal((await fetch(gatewayStatus, { headers: { connection: 'close' }, signal: AbortSignal.timeout(2000) })).status, 401);
+  const post = body => fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(2000) });
+  assert.equal((await post('{}')).status, 422);
+  assert.equal((await post(' '.repeat(4097))).status, 413);
+  await until(async () => (await http(daemon.socketPath, '/v1/push/status')).body.sent === 3,
+    '重启 Daemon 后应将已入库的通知送达 Gateway');
+  const receipts = queueRows(gatewayDb);
+  assert.equal(receipts.length, selected.length);
+  assert.ok(receipts.every(row => row.state === 'pending'));
+  const payloads = receipts.map(row => JSON.parse(row.payload));
+  const { hostId } = (await http(daemon.socketPath, '/v1/health')).body;
+  for (const { eventId, agent, eventType, occurredAt } of selected) {
+    assert.deepEqual(payloads.find(payload => payload.eventId === eventId),
+      { schemaVersion: 1, hostId, eventId, agent, eventType, occurredAt });
+  }
+  const first = payloads[0];
+  assert.equal((await post(JSON.stringify({ ...first, cwd: '/untrusted' }))).status, 200);
+  assert.equal((await post(JSON.stringify({ ...first, occurredAt: first.occurredAt + 1 }))).status, 409);
+  assert.equal((await http(daemon.socketPath, '/v1/events')).body.events.length, 5);
+
+  await close(gateway);
+  const attempts = new Map();
+  gateway = await startPushGateway({
+    ...options,
+    async deliver({ eventId }) {
+      const attempt = (attempts.get(eventId) ?? 0) + 1;
+      attempts.set(eventId, attempt);
+      if (eventId === first.eventId && attempt === 1) return { state: 'retry', code: 'test_unavailable' };
+      return { state: 'sent' };
+    },
+  });
+  await until(async () => {
+    const status = await fetch(gatewayStatus, { headers, signal: AbortSignal.timeout(2000) });
+    return (await status.json()).sent === selected.length;
+  }, 'Gateway 应恢复待投递通知，并重试暂时失败的请求');
+  assert.equal(attempts.size, selected.length);
+  assert.equal(attempts.get(first.eventId), 2);
+  assert.ok([...attempts].every(([id, count]) => id === first.eventId || count === 1));
 });

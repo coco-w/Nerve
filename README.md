@@ -1,12 +1,12 @@
 # Nerve
 
-Nerve 是面向 HarmonyOS 的远程开发工具。手机将通过 SSH/Mosh 直连开发机的 Zellij 会话。主机上的 Nerve Daemon 采集 Codex Hooks 和 Oh My Pi（OMP）扩展事件。独立的 Push Gateway 将把需要提醒的事件交给 Huawei Push Kit。
+Nerve 是面向 HarmonyOS 的远程开发工具。手机通过 SSH 直连开发机的 Zellij 会话。主机上的 Nerve Daemon 采集 Codex Hooks 和 Oh My Pi（OMP）扩展事件，独立的 Push Gateway 负责把需要提醒的事件交给 Huawei Push Kit。
 
 ## 当前进度
 
 - `entry/` 是 HarmonyOS 原生应用。手机通过 libssh2 直连主机，终端由本地打包的 xterm.js 绘制。可打开 Shell 或接入已有 Zellij 会话。连接页和终端默认使用内置的 Maple Mono NF CN 7.9。 [字体发布](https://github.com/subframe7536/maple-font/releases/tag/v7.9) · [字体许可证](entry/src/main/resources/rawfile/licenses/maple-mono-OFL)
 - `daemon/` 是 Node.js + TypeScript PoC。在同一系统用户下通过 Unix Socket 采集事件，写入 SQLite，并提供事件查询和 Zellij 会话、窗格列表。
-- 后续验证 Mosh，以及独立 Gateway 发送通知、锁屏接收和点击返回会话。Gateway 将使用最小通知字段，待发送记录应在本地持久化后再异步投递。
+- Push Gateway 是独立运行的服务。Daemon 和 Gateway 分别用 SQLite 保存待发送通知，支持本地收件联调和 Huawei Push Kit V3。后续验证 Mosh、鸿蒙真机锁屏接收，以及点击通知回到会话。
 
 ## 手机连接 SSH
 
@@ -93,6 +93,53 @@ omp -e /mnt/d/Huawei/Nerve/daemon/adapters/omp/extension.ts
 - `Stop` 和 `agent_end` 各自表示轮次或循环结束，任务结果需要更具体的原生信号。适配器向本地 Socket 请求最多等待 750 毫秒，Daemon 不可用时事件可能丢失。
 - 本地接口提供 `GET /v1/health`、`POST /v1/events` 和 `GET /v1/events?after=0&limit=50`。相同事件 ID 可幂等重试。查询使用稳定的 SQLite 写入序号翻页，客户端将 `nextCursor` 作为下次请求的 `after`。
 
+## 推送通知
+
+### Daemon 与 Gateway 联调
+
+Push Gateway 与 Daemon 使用同一份 Node.js 构建产物，各自运行。先在 `daemon/` 运行 `npm ci` 和 `npm run build`。在两个进程的启动环境中设置同一个 `NERVE_GATEWAY_TOKEN`，可用 `openssl rand -hex 32` 生成。
+
+在 Gateway 的终端运行以下命令。临时目录用于本地联调，通常部署时用 `~/.nerve-gateway` 或通过 `NERVE_GATEWAY_HOME` 指定私有目录（`0700`）。监听端口默认是 `8787`，可通过 `NERVE_GATEWAY_PORT` 设置。
+
+~~~bash
+NERVE_GATEWAY_HOME="$(mktemp -d)" npm run gateway
+~~~
+
+在 Daemon 的终端运行以下命令。Daemon 和 Agent 进程使用同一个 `NERVE_HOME`。跨主机时，在 Gateway 前部署 HTTPS 反向代理，把 `NERVE_GATEWAY_URL` 改成代理提供的通知地址。Gateway 本身监听 `127.0.0.1`。
+
+~~~bash
+export NERVE_HOME="$(mktemp -d)"
+export NERVE_GATEWAY_URL=http://127.0.0.1:8787/v1/notifications
+npm start
+~~~
+
+两个进程都开始监听后，在继承同一 `NERVE_HOME` 和 `NERVE_GATEWAY_TOKEN` 的终端发一条测试事件，并查询状态。
+
+~~~bash
+printf '%s\n' '{"hook_event_name":"Stop","session_id":"push-demo","cwd":"/tmp"}' | node dist/cli.js codex-hook
+node dist/cli.js push-status
+curl -fsS -H "Authorization: Bearer $NERVE_GATEWAY_TOKEN" http://127.0.0.1:8787/v1/status
+~~~
+
+- 启用推送后，新收到的 Codex `PermissionRequest`、`Stop` 和 OMP `agent_end` 会随事件一起入队。既有事件仍可查询；首次启用只收新事件。
+- 通知协议仅发送主机 ID、事件 ID、Agent、事件类型和时间。Gateway 按主机 ID 和事件 ID 判重。临时网络故障会退避重试，进程重启会恢复待发送队列。
+- `pending` 表示待投递或等待重试；Daemon 的 `sent` 表示 Gateway 确认已入库，Gateway 的 `sent` 表示 Huawei Push Kit 已接受请求。`failed` 表示协议拒绝或华为返回了不可自动恢复的错误，错误码可在对应进程日志查看。本地收件模式下，Gateway 中已接收的通知会保留为 `pending`。
+
+### 接入 Huawei Push Kit
+
+在华为 API Console 获取已开通 Push Kit 的项目服务账号 JSON，并准备同一 HarmonyOS 应用的设备 Push Token。将服务账号文件保存在仓库外，只在 Gateway 进程设置以下配置。 [华为服务账号鉴权](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides-V5/push-jwt-token-V5/) · [通知消息 V3](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-send-alert/)
+
+| 环境变量 | 用途 |
+| --- | --- |
+| `NERVE_HUAWEI_SERVICE_ACCOUNT_FILE` | 服务账号 JSON 的本地路径 |
+| `NERVE_HUAWEI_PUSH_TOKEN` | 接收通知的单台设备的 Push Token |
+| `NERVE_HUAWEI_CATEGORY` | 默认 `WORK`，对应项目的工作事项提醒权益。可设为 `MARKETING`，适用华为的静默通知及频控规则 |
+| `NERVE_HUAWEI_TEST_MESSAGE` | 设为 `1` 时使用华为的测试消息模式 |
+
+Gateway 读取这两项华为凭据后开始投递其目录中待发送的通知。锁屏正文使用固定模板，点击消息打开应用首页，并携带主机 ID 和事件 ID。真机 Token 获取和点击回会话由鸿蒙端接入。 [华为消息字段和通知分类](https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-scenariozed-api-request-param/)
+
 ## 验收
 
-在 WSL 运行 `npm test`，验证字段映射、并发去重、输入大小、游标和 SQLite 重启恢复。实机命令行联调使用真实 Codex 0.169.0、OMP 18.22.2 和 Zellij 0.46.0，模型回复由隔离的本地测试服务提供。上表 9 种原生事件均在实际运行中写入 SQLite，其中权限事件发生在 Codex 发出原生审批请求时。通过 `events` 查到各个 Agent 的原生事件后，可用 `panes` 核对 `zellij.paneId`。
+在 WSL 的 `daemon/` 运行 `npm test`，验证字段映射、并发去重、输入大小、游标、推送事务、掉线重试、双方重启恢复以及 Huawei V3 的签名和响应解析。实机命令行联调使用真实 Codex 0.169.0、OMP 18.22.2 和 Zellij 0.46.0，模型回复由隔离的本地测试服务提供。上表 9 种原生事件均在实际运行中写入 SQLite，其中权限事件发生在 Codex 发出原生审批请求时。通过 `events` 查到各个 Agent 的原生事件后，可用 `panes` 核对 `zellij.paneId`。
+
+推送联调期间先保持 Gateway 离线。三种提醒由真实 Agent 事件触发，并在 Gateway 启动后各入库一次。Huawei V3 发送路径使用本地测试响应验收，设备实际接收待接入 Huawei Push Kit 后验证。

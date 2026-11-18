@@ -2,6 +2,7 @@
 import { fileURLToPath } from 'node:url';
 import { codexEvents, fromCodexHook } from './agent.js';
 import { nerveHome, requestJson } from './local-http.js';
+import { pushTargetFromEnv } from './push-client.js';
 import { listPanes, listSessions } from './zellij.js';
 
 function printJson(value: unknown) {
@@ -46,7 +47,7 @@ async function main([command, arg, limit]: string[]) {
   switch (command) {
     case 'start': {
       const { startDaemon } = await import('./server.js');
-      const { server, socketPath } = await startDaemon(nerveHome());
+      const { server, socketPath } = await startDaemon(nerveHome(), pushTargetFromEnv(process.env));
       const stop = () => server.close();
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
@@ -55,6 +56,9 @@ async function main([command, arg, limit]: string[]) {
     }
     case 'health':
       printJson(await requestJson('/v1/health'));
+      break;
+    case 'push-status':
+      printJson(await requestJson('/v1/push/status'));
       break;
     case 'events': {
       const params = new URLSearchParams({ after: arg ?? '0', limit: limit ?? '50' });
@@ -76,7 +80,7 @@ async function main([command, arg, limit]: string[]) {
       break;
     case undefined:
     case '--help':
-      console.log('nerve start | health | events [after] [limit] | sessions | panes <session> | codex-config');
+      console.log('nerve start | health | push-status | events [after] [limit] | sessions | panes <session> | codex-config');
       break;
     default:
       throw new Error('未知命令，请运行 nerve --help');

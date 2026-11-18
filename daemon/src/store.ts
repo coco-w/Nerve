@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { StatementSync } from 'node:sqlite';
 import type { AgentEvent } from './agent.js';
+import { notificationFromEvent } from './notification.js';
+import { PushQueue } from './push-queue.js';
 
 export interface StoredEvent extends AgentEvent {
   hostId: string;
@@ -10,12 +12,13 @@ export interface StoredEvent extends AgentEvent {
 
 export class EventStore {
   readonly hostId: string;
+  readonly pushQueue: PushQueue;
   private readonly db: DatabaseSync;
   private readonly insert: StatementSync;
   private readonly lookup: StatementSync;
   private readonly list: StatementSync;
 
-  constructor(path: string) {
+  constructor(path: string, readonly pushEnabled = false) {
     this.db = new DatabaseSync(path, { timeout: 2500 });
     try {
       this.db.exec(
@@ -37,6 +40,7 @@ export class EventStore {
       );
       this.lookup = this.db.prepare('SELECT sequence, event_json FROM agent_events WHERE event_id = ?');
       this.list = this.db.prepare('SELECT sequence, event_json FROM agent_events WHERE sequence > ? ORDER BY sequence LIMIT ?');
+      this.pushQueue = new PushQueue(this.db);
     } catch (error) {
       this.db.close();
       throw error;
@@ -45,11 +49,22 @@ export class EventStore {
 
   append(event: AgentEvent) {
     const json = JSON.stringify(event);
-    // 唯一约束保证并发写入和同 ID 重试只落一条记录。
-    const result = this.insert.run(event.eventId, json);
-    const row = this.lookup.get(event.eventId);
-    if (typeof row?.sequence !== 'number') throw new Error('无法读取已写入事件');
-    return { sequence: row.sequence, inserted: result.changes === 1, conflict: row.event_json !== json };
+    // 新事件和待投递通知同一事务提交，Hook 的请求链路只访问本地 SQLite。
+    const notification = this.pushEnabled ? notificationFromEvent(this.hostId, event) : undefined;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const inserted = this.insert.run(event.eventId, json).changes === 1;
+      const row = this.lookup.get(event.eventId);
+      if (typeof row?.sequence !== 'number') throw new Error('无法读取已写入事件');
+      if (inserted && notification && this.pushQueue.enqueue(notification) === 'conflict') {
+        throw new Error('待投递通知标识冲突');
+      }
+      this.db.exec('COMMIT');
+      return { sequence: row.sequence, inserted, conflict: row.event_json !== json };
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   after(sequence: number, limit: number): StoredEvent[] {

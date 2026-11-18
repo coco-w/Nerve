@@ -12,6 +12,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/cli.js start",
+    "gateway": "node dist/gateway/cli.js",
     "test": "npm run build && node --test"
   },
   "devDependencies": {
