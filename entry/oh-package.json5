@@ -5,6 +5,8 @@
   "main": "",
   "author": "",
   "license": "",
-  "dependencies": {}
+  "dependencies": {
+    "libnerve_ssh.so": "file:./src/main/cpp/types/libnerve_ssh"
+  }
 }
 

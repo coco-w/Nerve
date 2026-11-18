@@ -4,9 +4,33 @@ Nerve 是面向 HarmonyOS 的远程开发工具。手机将通过 SSH/Mosh 直�
 
 ## 当前进度
 
-- 根目录是现有的 DevEco Studio 单模块工程。入口在 `entry/`，当前能构建未签名 HAP。
+- `entry/` 是 HarmonyOS 原生应用。手机通过 libssh2 直连主机，终端由本地打包的 xterm.js 绘制。可打开 Shell 或接入已有 Zellij 会话。
 - `daemon/` 是 Node.js + TypeScript PoC。在同一系统用户下通过 Unix Socket 采集事件，写入 SQLite，并提供事件查询和 Zellij 会话、窗格列表。
-- 下一阶段先用鸿蒙真机验证 SSH PTY、终端尺寸同步和 `zellij attach`。随后验证 Mosh，以及通过独立 Gateway 发送系统通知、锁屏接收和点击后回到会话。Gateway 将使用最小通知字段，待发送记录应在本地持久化后再异步投递。
+- 后续验证 Mosh，以及独立 Gateway 发送通知、锁屏接收和点击返回会话。Gateway 将使用最小通知字段，待发送记录应在本地持久化后再异步投递。
+
+## 手机连接 SSH
+
+1. 确认手机能访问开发机的 SSH 服务。使用运行 Zellij 的同一个远端用户登录。自动附接按 Zellij 0.46.0 联调，要求 `zellij` 位于该用户远端命令的 `PATH` 中。会话名可以用 `zellij list-sessions` 查看。
+2. 在开发机本地核对 SSH 主机公钥。OpenSSH 的常见配置可运行 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256`。把完整的 `SHA256:…` 值填入 Nerve。Nerve 优先协商 Ed25519 主机密钥，服务端使用其他主机密钥时请核对相应的公钥文件。
+3. 填写主机、端口和用户名。可输入密码，或通过文件选择器打开 OpenSSH 或 PEM 私钥并按需输入口令。凭据只用于本次连接。填写已有会话的完整名称可直接附接，留空会打开 Shell，也可在 Shell 中手动运行 `zellij attach <会话名>`。
+4. 点击终端弹出软键盘。底部提供 Ctrl、Esc、Tab 和方向键。点一次 Ctrl 再输入字母可发送组合键。窗口尺寸变化时会同步给主机。点击「断开」退出当前 SSH 连接，已有 Zellij 会话继续运行。
+
+### 构建与联调
+
+使用 DevEco Studio 或在项目根目录运行 `devecocli build`。HAP 位于 `entry/build/default/outputs/default/`，包含手机用的 arm64-v8a 和模拟器用的 x86_64 原生库。安装到设备前请先在本地配置 Nerve 的调试签名。
+
+首次原生构建需获取固定版本的 libssh2 1.11.1 和 AWS-LC 5.15.0。CMake 会校验归档的 SHA-256。网络受限时，把原始归档按 `libssh2-1.11.1.tar.gz` 和 `aws-lc-5.15.0.tar.gz` 命名，将 `NERVE_SSH_ARCHIVE_DIR` 指向所在目录后启动构建。使用 Hvigor 常驻进程时，先重启当前项目的构建进程以读取新的环境变量。终端渲染资源随 HAP 打包，其中 xterm.js 为 6.0.0，FitAddon 为 0.11.0。
+
+原生联调程序从 Linux 构建运行。请用独立的测试 SSH 账户或临时授权的测试密钥。给定会话名时，程序会在其当前窗格中输入测试命令，窗格需运行 Shell 且先显示过 `NERVE_ZELLIJ_READY`。
+
+~~~bash
+cmake -S entry/src/main/cpp -B /tmp/nerve-ssh-build -DNERVE_BUILD_SMOKE_TEST=ON
+cmake --build /tmp/nerve-ssh-build --target nerve_ssh_smoke --parallel
+/tmp/nerve-ssh-build/nerve_ssh_smoke 主机 端口 用户 SHA256:指纹 私钥文件
+/tmp/nerve-ssh-build/nerve_ssh_smoke 主机 端口 用户 SHA256:指纹 私钥文件 测试会话名
+~~~
+
+如测试私钥带口令，可通过 `NERVE_SMOKE_KEY_PASSPHRASE` 传入。联调覆盖错误指纹、私钥登录、UTF-8 交互、终端尺寸同步和已有会话附接。
 
 ## 运行 Daemon
 

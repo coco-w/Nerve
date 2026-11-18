@@ -1,23 +1,620 @@
+import { webview } from '@kit.ArkWeb';
+import { KeyboardAvoidMode } from '@kit.ArkUI';
+import { fileIo, picker } from '@kit.CoreFileKit';
+import { util } from '@kit.ArkTS';
+import { connect, disconnect, read, resize, SshConnectOptions, SshHandle, write } from 'libnerve_ssh.so';
+
+// ArkWeb 拦截时使用资源 URL，加载后可能显示为 RAWFILE 格式。
+const TERMINAL_URL = 'resource://rawfile/terminal/index.html';
+const TERMINAL_LOADED_URL = 'resource:/RAWFILE/terminal/index.html';
+const TERMINAL_FILE_URL = 'file:///data/storage/el1/bundle/entry/resources/rawfile/terminal/index.html';
+const POLL_MS = 30;
+const MAX_CHUNK_BYTES = 16 * 1024;
+const MAX_QUEUED_BYTES = 64 * 1024;
+const MAX_KEY_BYTES = 32 * 1024;
+const BACKGROUND = '#10191e';
+const SURFACE = '#1c2b32';
+const FOREGROUND = '#e4f0f0';
+const MUTED = '#a1b5bd';
+const ACCENT = '#7ae0bb';
+const ERROR = '#ffb7a9';
+
+interface PtySize {
+  columns: number;
+  rows: number;
+}
+
+// 渲染层只传终端输入、尺寸和渲染确认，连接信息及凭据由 ArkTS 持有。
+class TerminalBridge {
+  private readonly input: (text: string) => void;
+  private readonly binaryInput: (encoded: string) => void;
+  private readonly size: (columns: number, rows: number) => void;
+  private readonly outputFlushed: () => void;
+
+  constructor(input: (text: string) => void, binaryInput: (encoded: string) => void,
+    size: (columns: number, rows: number) => void, outputFlushed: () => void) {
+    this.input = input;
+    this.binaryInput = binaryInput;
+    this.size = size;
+    this.outputFlushed = outputFlushed;
+  }
+
+  onInput(text: string): void {
+    this.input(text);
+  }
+
+  onBinary(encoded: string): void {
+    this.binaryInput(encoded);
+  }
+
+  onSize(columns: number, rows: number): void {
+    this.size(columns, rows);
+  }
+
+  onOutputFlushed(): void {
+    this.outputFlushed();
+  }
+}
+
 @Entry
 @Component
 struct Index {
-  @State message: string = 'Hello World';
+  @State private host: string = '';
+  @State private port: string = '22';
+  @State private username: string = '';
+  @State private fingerprint: string = '';
+  @State private zellijSession: string = '';
+  @State private usePrivateKey: boolean = false;
+  @State private keySelected: boolean = false;
+  @State private password: string = '';
+  @State private passphrase: string = '';
+  @State private terminalVisible: boolean = false;
+  @State private connected: boolean = false;
+  @State private statusText: string = '';
+  @State private errorText: string = '';
+  @State private ctrlArmed: boolean = false;
+
+  private privateKey: string = '';
+  private formKeyboardMode: KeyboardAvoidMode = KeyboardAvoidMode.OFFSET;
+  private view = new webview.WebviewController();
+  private readonly encoder = new util.TextEncoder();
+  private readonly base64 = new util.Base64Helper();
+  private bridge = this.createBridge(0);
+
+  // 连接代次会在退出时增加，丢弃此前未完成的握手和渲染回调。
+  private generation: number = 0;
+  private connection: SshHandle | undefined;
+  private pendingConnection: SshConnectOptions | undefined;
+  private loadTimer: number = -1;
+  private ioTimer: number = -1;
+  private inputQueue: Array<ArrayBuffer> = [];
+  private inputOffset: number = 0;
+  private queuedBytes: number = 0;
+  private writePending: boolean = false;
+  private renderPending: boolean = false;
+  private latestSize: PtySize = { columns: 80, rows: 24 };
+  private sentSize: PtySize = { columns: 80, rows: 24 };
+  private resizePending: PtySize | undefined;
+
+  onBackPress(): boolean {
+    if (!this.terminalVisible) {
+      return false;
+    }
+    this.backToForm();
+    return true;
+  }
+
+  aboutToDisappear(): void {
+    if (this.terminalVisible) {
+      this.getUIContext().setKeyboardAvoidMode(this.formKeyboardMode);
+    }
+    this.stopConnection();
+    this.clearCredentials();
+  }
+
+  private clearCredentials(): void {
+    this.password = '';
+    this.privateKey = '';
+    this.passphrase = '';
+    this.keySelected = false;
+  }
+
+  private changeAuth(usePrivateKey: boolean): void {
+    if (this.usePrivateKey !== usePrivateKey) {
+      this.clearCredentials();
+      this.usePrivateKey = usePrivateKey;
+      this.errorText = '';
+    }
+  }
+
+  private async selectKey(): Promise<void> {
+    const context = this.getUIContext().getHostContext();
+    if (!context) {
+      return;
+    }
+    const generation = this.generation;
+    try {
+      const options = new picker.DocumentSelectOptions();
+      options.maxSelectNumber = 1;
+      const uris = await new picker.DocumentViewPicker(context).select(options);
+      if (!uris.length || !this.usePrivateKey || this.generation !== generation) {
+        return;
+      }
+      // 文件选择器提供 URI，以文件描述符限量读取，无需复制到应用目录。
+      const file = await fileIo.open(uris[0], fileIo.OpenMode.READ_ONLY);
+      let content = '';
+      try {
+        const data = new ArrayBuffer(MAX_KEY_BYTES + 1);
+        const size = await fileIo.read(file.fd, data);
+        if (size <= MAX_KEY_BYTES) {
+          content = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(data, 0, size));
+        }
+      } finally {
+        await fileIo.close(file);
+      }
+      if (!this.usePrivateKey || this.generation !== generation) {
+        return;
+      }
+      if (!/^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(content)) {
+        this.errorText = '请选择有效的 OpenSSH 或 PEM 私钥文件。';
+        return;
+      }
+      this.privateKey = content.replace(/\r\n/g, '\n');
+      this.keySelected = true;
+      this.errorText = '';
+    } catch (_) {
+      if (this.generation === generation) {
+        this.errorText = '无法读取所选的私钥文件。';
+      }
+    }
+  }
+
+  private startConnection(): void {
+    if (this.terminalVisible) {
+      return;
+    }
+    const host = this.host.trim().replace(/^\[([^\]]+)\]$/, '$1');
+    const username = this.username.trim();
+    const port = Number(this.port);
+    const fingerprint = this.fingerprint.trim();
+    const session = this.zellijSession.trim();
+    if (!host || !username || !/^\d{1,5}$/.test(this.port) || port < 1 || port > 65535) {
+      this.errorText = '请填写主机地址、用户名和 1–65535 范围内的端口。';
+      return;
+    }
+    if (!/^SHA256:[A-Za-z0-9+/]{43}$/.test(fingerprint)) {
+      this.errorText = '请输入主机公钥的完整 SHA256 指纹。';
+      return;
+    }
+    if (session && !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(session)) {
+      this.errorText = '会话名可使用字母、数字、下划线、点和连字符。留空后可在终端中手动附接。';
+      return;
+    }
+    if ((this.usePrivateKey && !this.keySelected) || (!this.usePrivateKey && !this.password)) {
+      this.errorText = this.usePrivateKey ? '请选择 SSH 私钥。' : '请输入 SSH 密码。';
+      return;
+    }
+
+    this.pendingConnection = {
+      host, port, username, fingerprint, password: this.password, privateKey: this.privateKey,
+      passphrase: this.passphrase, zellijSession: session, columns: 80, rows: 24
+    };
+    this.clearCredentials();
+    this.errorText = '';
+    const generation = ++this.generation;
+    this.statusText = '正在打开终端';
+    this.view = new webview.WebviewController();
+    this.bridge = this.createBridge(generation);
+    // 键盘弹出时调整整个终端视图，快捷键栏留在键盘上方。
+    const context = this.getUIContext();
+    this.formKeyboardMode = context.getKeyboardAvoidMode();
+    context.setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
+    this.terminalVisible = true;
+    this.loadTimer = setTimeout(() => {
+      if (this.generation === generation && this.pendingConnection) {
+        this.failOpening('终端启动超时，请重试。');
+      }
+    }, 8000);
+  }
+
+  private createBridge(generation: number): TerminalBridge {
+    return new TerminalBridge(
+      (text: string) => { if (this.generation === generation) this.queueText(text); },
+      (encoded: string) => { if (this.generation === generation) this.queueBinary(encoded); },
+      (columns: number, rows: number) => {
+        if (this.generation === generation) this.onTerminalSize(columns, rows);
+      },
+      () => { if (this.generation === generation) this.renderPending = false; }
+    );
+  }
+
+  private onTerminalSize(columns: number, rows: number): void {
+    if (!this.terminalVisible || !Number.isInteger(columns) || !Number.isInteger(rows) || columns < 2 || rows < 2) {
+      return;
+    }
+    this.latestSize = { columns: Math.min(columns, 500), rows: Math.min(rows, 500) };
+    const options = this.pendingConnection;
+    if (options) {
+      this.pendingConnection = undefined;
+      clearTimeout(this.loadTimer);
+      this.loadTimer = -1;
+      options.columns = this.latestSize.columns;
+      options.rows = this.latestSize.rows;
+      this.sentSize = this.latestSize;
+      this.openConnection(options, this.generation);
+    }
+  }
+
+  private async openConnection(options: SshConnectOptions, generation: number): Promise<void> {
+    try {
+      this.statusText = '正在连接 SSH';
+      const opening = connect(options);
+      // 原生模块同步复制所需参数，后台握手期间不再持有表单副本。
+      options.password = '';
+      options.privateKey = '';
+      options.passphrase = '';
+      const connection = await opening;
+      if (this.generation !== generation) {
+        disconnect(connection);
+        return;
+      }
+      this.connection = connection;
+      this.connected = true;
+      this.statusText = 'SSH 已连接';
+      this.ioTimer = setInterval(() => this.pumpTerminal(), POLL_MS);
+    } catch (error) {
+      if (this.generation === generation) {
+        this.failOpening((error as Error).message || 'SSH 连接失败。');
+      }
+    }
+  }
+
+  private failOpening(message: string): void {
+    this.backToForm();
+    this.errorText = message;
+  }
+
+  private backToForm(): void {
+    this.stopConnection();
+    this.terminalVisible = false;
+    this.getUIContext().setKeyboardAvoidMode(this.formKeyboardMode);
+    this.errorText = '';
+  }
+
+  private stopConnection(): void {
+    this.generation++;
+    clearTimeout(this.loadTimer);
+    clearInterval(this.ioTimer);
+    this.loadTimer = -1;
+    this.ioTimer = -1;
+    this.pendingConnection = undefined;
+    const connection = this.connection;
+    this.connection = undefined;
+    if (connection) {
+      disconnect(connection);
+    }
+    this.connected = false;
+    this.ctrlArmed = false;
+    this.inputQueue = [];
+    this.queuedBytes = 0;
+    this.inputOffset = 0;
+    this.writePending = false;
+    this.renderPending = false;
+    this.resizePending = undefined;
+  }
+
+  private queueText(text: string): void {
+    if (!this.connected || !text) {
+      return;
+    }
+    if (this.ctrlArmed && text.length === 1) {
+      const ch = text.toUpperCase().charCodeAt(0);
+      if (ch >= 64 && ch <= 95) {
+        text = String.fromCharCode(ch & 31);
+      }
+      this.ctrlArmed = false;
+    }
+    if (text.length > MAX_QUEUED_BYTES) {
+      this.errorText = '输入太长，请分段发送。';
+      return;
+    }
+    this.queueBytes(this.encoder.encodeInto(text));
+  }
+
+  private queueBinary(encoded: string): void {
+    if (this.connected && encoded.length <= 4 * MAX_CHUNK_BYTES) {
+      this.queueBytes(this.base64.decodeSync(encoded));
+    }
+  }
+
+  private queueBytes(bytes: Uint8Array): void {
+    if (this.queuedBytes + bytes.length > MAX_QUEUED_BYTES) {
+      this.errorText = '终端输入队列已满，请稍后分段发送。';
+      return;
+    }
+    this.errorText = '';
+    for (let offset = 0; offset < bytes.length; offset += MAX_CHUNK_BYTES) {
+      const length = Math.min(MAX_CHUNK_BYTES, bytes.length - offset);
+      const chunk = new ArrayBuffer(length);
+      new Uint8Array(chunk).set(bytes.subarray(offset, offset + length));
+      this.inputQueue.push(chunk);
+    }
+    this.queuedBytes += bytes.length;
+  }
+
+  private sendInput(connection: SshHandle): boolean {
+    if (this.inputQueue.length === 0) {
+      return true;
+    }
+    const chunk = this.inputQueue[0];
+    const sent = write(connection, chunk, this.inputOffset);
+    this.writePending = sent === 0;
+    this.inputOffset += sent;
+    this.queuedBytes -= sent;
+    if (this.inputOffset === chunk.byteLength) {
+      this.inputQueue.shift();
+      this.inputOffset = 0;
+    }
+    return !this.writePending;
+  }
+
+  private pumpTerminal(): void {
+    const connection = this.connection;
+    if (!connection) {
+      return;
+    }
+    try {
+      // libssh2 需以相同的参数重试未完成的写入或窗口尺寸请求。
+      if (this.writePending && !this.sendInput(connection)) {
+        return;
+      }
+      if (this.latestSize.columns !== this.sentSize.columns || this.latestSize.rows !== this.sentSize.rows) {
+        this.resizePending = this.resizePending ?? this.latestSize;
+      }
+      const size = this.resizePending;
+      if (size) {
+        if (!resize(connection, size.columns, size.rows)) {
+          return;
+        }
+        this.sentSize = size;
+        this.resizePending = undefined;
+      }
+      if (!this.sendInput(connection) || this.renderPending) {
+        return;
+      }
+      const bytes = read(connection);
+      if (bytes === undefined) {
+        return;
+      }
+      if (bytes.byteLength === 0) {
+        this.stopConnection();
+        this.statusText = '远端已断开';
+        return;
+      }
+      this.renderPending = true;
+      const encoded = this.base64.encodeToStringSync(new Uint8Array(bytes));
+      this.runTerminalScript('window.nerveTerminal.write(' + JSON.stringify(encoded) + ')');
+    } catch (error) {
+      this.stopConnection();
+      this.statusText = 'SSH 已断开';
+      this.errorText = (error as Error).message || '终端连接中断。';
+    }
+  }
+
+  private runTerminalScript(script: string): void {
+    const generation = this.generation;
+    this.view.runJavaScript(script).catch(() => {
+      if (this.generation === generation && this.terminalVisible) {
+        this.onTerminalError();
+      }
+    });
+  }
+
+  private onTerminalError(): void {
+    if (this.connected) {
+      this.stopConnection();
+      this.statusText = 'SSH 已断开';
+      this.errorText = '终端显示中断，请重新连接。';
+    } else if (this.terminalVisible) {
+      this.failOpening('无法加载内置终端，请重试。');
+    }
+  }
+
+  @Builder
+  field(label: string, value: string, placeholder: string, inputType: InputType, max: number,
+    change: (value: string) => void) {
+    Column({ space: 6 }) {
+      Text(label).fontSize(13).fontColor(MUTED)
+      TextInput({ text: value, placeholder: placeholder })
+        .type(inputType)
+        .maxLength(max)
+        .height(44)
+        .fontSize(15)
+        .fontColor(FOREGROUND)
+        .placeholderColor(MUTED)
+        .backgroundColor(SURFACE)
+        .borderRadius(10)
+        .onChange(change)
+    }
+    .alignItems(HorizontalAlign.Start)
+    .width('100%')
+  }
+
+  @Builder
+  authButton(label: string, useKey: boolean) {
+    Button(label, { type: ButtonType.Normal })
+      .layoutWeight(1)
+      .height(38)
+      .borderRadius(8)
+      .fontSize(14)
+      .fontColor(this.usePrivateKey === useKey ? BACKGROUND : FOREGROUND)
+      .backgroundColor(this.usePrivateKey === useKey ? ACCENT : SURFACE)
+      .onClick(() => this.changeAuth(useKey))
+  }
+
+  @Builder
+  formatKey(label: string, name: string, description: string) {
+    Button(label, { type: ButtonType.Normal })
+      .layoutWeight(1)
+      .padding(0)
+      .height(38)
+      .borderRadius(8)
+      .fontSize(14)
+      .fontColor(FOREGROUND)
+      .backgroundColor(SURFACE)
+      .accessibilityText(description)
+      .focusOnTouch(false)
+      .enabled(this.connected)
+      .onClick(() => this.runTerminalScript('window.nerveTerminal.key(' + JSON.stringify(name) + ')'))
+  }
+
+  @Builder
+  connectionForm() {
+    Scroll() {
+      Column({ space: 14 }) {
+        Row({ space: 12 }) {
+          Text('>_')
+            .fontSize(18)
+            .fontFamily('monospace')
+            .fontColor(ACCENT)
+            .textAlign(TextAlign.Center)
+            .width(44)
+            .height(42)
+            .backgroundColor(SURFACE)
+            .borderRadius(10)
+          Column({ space: 2 }) {
+            Text('Nerve').fontSize(25).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
+            Text('SSH 连接').fontSize(13).fontColor(MUTED)
+          }.alignItems(HorizontalAlign.Start)
+        }.width('100%').margin({ bottom: 8 })
+        this.field('主机地址', this.host, '例如 dev.example.local', InputType.Normal, 253,
+          (value: string) => { this.host = value; })
+        Row({ space: 10 }) {
+          Column() {
+            this.field('用户名', this.username, 'SSH 用户', InputType.Normal, 128,
+              (value: string) => { this.username = value; })
+          }.layoutWeight(2)
+          Column() {
+            this.field('端口', this.port, '22', InputType.Number, 5,
+              (value: string) => { this.port = value; })
+          }.layoutWeight(1)
+        }.width('100%')
+        this.field('主机指纹', this.fingerprint, 'SHA256:…', InputType.Normal, 64,
+          (value: string) => { this.fingerprint = value; })
+        this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
+          (value: string) => { this.zellijSession = value; })
+        Row({ space: 8 }) {
+          this.authButton('密码', false)
+          this.authButton('私钥', true)
+        }.width('100%')
+        if (this.usePrivateKey) {
+          Button(this.keySelected ? '已选私钥 · 更换' : '选择私钥文件', { type: ButtonType.Normal })
+            .width('100%')
+            .height(44)
+            .borderRadius(10)
+            .fontColor(FOREGROUND)
+            .backgroundColor(SURFACE)
+            .onClick(() => { this.selectKey(); })
+          this.field('私钥口令', this.passphrase, '未加密时留空', InputType.Password, 1024,
+            (value: string) => { this.passphrase = value; })
+        } else {
+          this.field('SSH 密码', this.password, '输入密码', InputType.Password, 1024,
+            (value: string) => { this.password = value; })
+        }
+        if (this.errorText) {
+          Text(this.errorText).fontColor(ERROR).fontSize(14).width('100%').copyOption(CopyOptions.LocalDevice)
+        }
+        Button('连接', { type: ButtonType.Normal })
+          .width('100%')
+          .height(48)
+          .borderRadius(10)
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(BACKGROUND)
+          .backgroundColor(ACCENT)
+          .onClick(() => this.startConnection())
+      }
+      .padding({ left: 20, top: 18, right: 20, bottom: 28 })
+      .alignItems(HorizontalAlign.Start)
+      .constraintSize({ maxWidth: 540 })
+      .width('100%')
+    }
+    .width('100%')
+    .height('100%')
+    .align(Alignment.Top)
+  }
+
+  @Builder
+  terminalView() {
+    Column() {
+      Row({ space: 10 }) {
+        Column({ space: 4 }) {
+          Text(this.zellijSession.trim() || this.host.trim())
+            .fontSize(17).fontWeight(FontWeight.Medium).fontColor(FOREGROUND).maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(this.statusText).fontSize(12).fontColor(this.connected ? ACCENT : MUTED)
+        }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+        Button(this.connected ? '断开' : '返回', { type: ButtonType.Normal })
+          .height(34).borderRadius(8).fontSize(13).fontColor(FOREGROUND).backgroundColor(SURFACE)
+          .onClick(() => this.backToForm())
+      }.width('100%').padding({ left: 12, top: 8, right: 12, bottom: 8 })
+      Web({ src: $rawfile('terminal/index.html'), controller: this.view })
+        .width('100%')
+        .layoutWeight(1)
+        .backgroundColor('#0d1418')
+        .javaScriptAccess(true)
+        .fileAccess(false)
+        .domStorageAccess(false)
+        .blockNetwork(true)
+        .multiWindowAccess(false)
+        .allowWindowOpenMethod(false)
+        .javaScriptProxy({
+          object: this.bridge,
+          name: 'nerveHost',
+          methodList: ['onSize', 'onInput', 'onBinary', 'onOutputFlushed'],
+          controller: this.view
+        })
+        .onLoadIntercept(event => {
+          const url = event.data.getRequestUrl();
+          return event.data.isMainFrame() && url !== TERMINAL_URL && url !== TERMINAL_LOADED_URL &&
+            url !== TERMINAL_FILE_URL;
+        })
+        .onPageEnd(() => this.runTerminalScript('window.nerveTerminal.start()'))
+        .onRenderExited(() => this.onTerminalError())
+      if (this.errorText) {
+        Text(this.errorText).width('100%').fontColor(ERROR).fontSize(13).padding({ left: 12, right: 12, top: 6 })
+      }
+      Row({ space: 5 }) {
+        Button('Ctrl', { type: ButtonType.Normal })
+          .layoutWeight(1).padding(0).height(38).borderRadius(8).fontSize(14)
+          .fontColor(this.ctrlArmed ? BACKGROUND : FOREGROUND)
+          .backgroundColor(this.ctrlArmed ? ACCENT : SURFACE)
+          .focusOnTouch(false)
+          .enabled(this.connected)
+          .onClick(() => {
+            this.ctrlArmed = !this.ctrlArmed;
+            this.runTerminalScript('window.nerveTerminal.focus()');
+          })
+        this.formatKey('Esc', 'escape', 'Escape 键')
+        this.formatKey('Tab', 'tab', 'Tab 键')
+        this.formatKey('←', 'left', '左方向键')
+        this.formatKey('↓', 'down', '下方向键')
+        this.formatKey('↑', 'up', '上方向键')
+        this.formatKey('→', 'right', '右方向键')
+      }.padding({ left: 8, top: 6, right: 8, bottom: 8 }).width('100%')
+    }.width('100%').height('100%')
+  }
 
   build() {
-    RelativeContainer() {
-      Text(this.message)
-        .id('HelloWorld')
-        .fontSize($r('app.float.page_text_font_size'))
-        .fontWeight(FontWeight.Bold)
-        .alignRules({
-          center: { anchor: '__container__', align: VerticalAlign.Center },
-          middle: { anchor: '__container__', align: HorizontalAlign.Center }
-        })
-        .onClick(() => {
-          this.message = 'Welcome';
-        })
+    Column() {
+      if (this.terminalVisible) {
+        this.terminalView()
+      } else {
+        this.connectionForm()
+      }
     }
-    .height('100%')
     .width('100%')
+    .height('100%')
+    .backgroundColor(BACKGROUND)
   }
 }

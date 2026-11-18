@@ -1,0 +1,6 @@
+{
+  "name": "libnerve_ssh.so",
+  "version": "1.0.0",
+  "description": "Nerve SSH 原生终端桥接",
+  "types": "./Index.d.ts"
+}

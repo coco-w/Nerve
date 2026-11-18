@@ -1,0 +1,13 @@
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #0d1418;
+}
+
+#terminal {
+  /* 用实际容器尺寸测量字符网格，避免上下边距裁掉最后一行。 */
+  position: absolute;
+  inset: 8px 6px 4px 10px;
+}
