@@ -1,8 +1,10 @@
 'use strict';
 
+const FONT_FAMILY = 'Maple Mono';
+const FONT_SIZE = 14;
 const terminal = new Terminal({
-  fontFamily: 'monospace',
-  fontSize: 14,
+  fontFamily: `"${FONT_FAMILY}", monospace`,
+  fontSize: FONT_SIZE,
   scrollback: 1500,
   cursorBlink: true,
   theme: { background: '#0d1418', foreground: '#e3eced', cursor: '#7ae0bb', selectionBackground: '#334e53' },
@@ -12,7 +14,6 @@ const terminal = new Terminal({
 const fit = new FitAddon.FitAddon();
 const container = document.getElementById('terminal');
 terminal.loadAddon(fit);
-terminal.open(container);
 
 let native = null;
 let fitFrame = 0;
@@ -40,8 +41,15 @@ terminal.onBinary(bytes => {
 });
 
 window.nerveTerminal = {
-  start() {
-    // 由 ArkWeb 页面加载完成回调启动，此时原生桥已注册。
+  async start() {
+    // 字体就绪后再打开终端，首次字符测量与 SSH 请求使用同一套网格。
+    try {
+      await document.fonts.load(`${FONT_SIZE}px "${FONT_FAMILY}"`);
+    } catch {
+      console.warn('无法加载内置 Maple Mono 字体，将使用等宽字体。');
+    }
+    if (terminal.element) return;
+    terminal.open(container);
     native = window.nerveHost;
     sendSize();
   },

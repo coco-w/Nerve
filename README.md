@@ -4,7 +4,7 @@ Nerve 是面向 HarmonyOS 的远程开发工具。手机将通过 SSH/Mosh 直�
 
 ## 当前进度
 
-- `entry/` 是 HarmonyOS 原生应用。手机通过 libssh2 直连主机，终端由本地打包的 xterm.js 绘制。可打开 Shell 或接入已有 Zellij 会话。
+- `entry/` 是 HarmonyOS 原生应用。手机通过 libssh2 直连主机，终端由本地打包的 xterm.js 绘制。可打开 Shell 或接入已有 Zellij 会话。连接页和终端默认使用内置的 Maple Mono NF CN 7.9。 [字体发布](https://github.com/subframe7536/maple-font/releases/tag/v7.9) · [字体许可证](entry/src/main/resources/rawfile/licenses/maple-mono-OFL)
 - `daemon/` 是 Node.js + TypeScript PoC。在同一系统用户下通过 Unix Socket 采集事件，写入 SQLite，并提供事件查询和 Zellij 会话、窗格列表。
 - 后续验证 Mosh，以及独立 Gateway 发送通知、锁屏接收和点击返回会话。Gateway 将使用最小通知字段，待发送记录应在本地持久化后再异步投递。
 

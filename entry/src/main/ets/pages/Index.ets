@@ -12,6 +12,8 @@ const POLL_MS = 30;
 const MAX_CHUNK_BYTES = 16 * 1024;
 const MAX_QUEUED_BYTES = 64 * 1024;
 const MAX_KEY_BYTES = 32 * 1024;
+// ArkUI 与 ArkWeb 使用同一份内置的 Maple Mono 字体。
+const APP_FONT = 'Maple Mono';
 const BACKGROUND = '#10191e';
 const SURFACE = '#1c2b32';
 const FOREGROUND = '#e4f0f0';
@@ -95,6 +97,13 @@ struct Index {
   private latestSize: PtySize = { columns: 80, rows: 24 };
   private sentSize: PtySize = { columns: 80, rows: 24 };
   private resizePending: PtySize | undefined;
+
+  aboutToAppear(): void {
+    this.getUIContext().getFont().registerFont({
+      familyName: APP_FONT,
+      familySrc: $rawfile('fonts/MapleMono-NF-CN-Regular.ttf')
+    });
+  }
 
   onBackPress(): boolean {
     if (!this.terminalVisible) {
@@ -424,13 +433,15 @@ struct Index {
   field(label: string, value: string, placeholder: string, inputType: InputType, max: number,
     change: (value: string) => void) {
     Column({ space: 6 }) {
-      Text(label).fontSize(13).fontColor(MUTED)
+      Text(label).fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
       TextInput({ text: value, placeholder: placeholder })
         .type(inputType)
         .maxLength(max)
         .height(44)
         .fontSize(15)
+        .fontFamily(APP_FONT)
         .fontColor(FOREGROUND)
+        .placeholderFont({ size: 15, family: APP_FONT })
         .placeholderColor(MUTED)
         .backgroundColor(SURFACE)
         .borderRadius(10)
@@ -446,6 +457,7 @@ struct Index {
       .layoutWeight(1)
       .height(38)
       .borderRadius(8)
+      .fontFamily(APP_FONT)
       .fontSize(14)
       .fontColor(this.usePrivateKey === useKey ? BACKGROUND : FOREGROUND)
       .backgroundColor(this.usePrivateKey === useKey ? ACCENT : SURFACE)
@@ -459,6 +471,7 @@ struct Index {
       .padding(0)
       .height(38)
       .borderRadius(8)
+      .fontFamily(APP_FONT)
       .fontSize(14)
       .fontColor(FOREGROUND)
       .backgroundColor(SURFACE)
@@ -475,7 +488,7 @@ struct Index {
         Row({ space: 12 }) {
           Text('>_')
             .fontSize(18)
-            .fontFamily('monospace')
+            .fontFamily(APP_FONT)
             .fontColor(ACCENT)
             .textAlign(TextAlign.Center)
             .width(44)
@@ -483,8 +496,8 @@ struct Index {
             .backgroundColor(SURFACE)
             .borderRadius(10)
           Column({ space: 2 }) {
-            Text('Nerve').fontSize(25).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
-            Text('SSH 连接').fontSize(13).fontColor(MUTED)
+            Text('Nerve').fontFamily(APP_FONT).fontSize(25).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
+            Text('SSH 连接').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
           }.alignItems(HorizontalAlign.Start)
         }.width('100%').margin({ bottom: 8 })
         this.field('主机地址', this.host, '例如 dev.example.local', InputType.Normal, 253,
@@ -512,6 +525,7 @@ struct Index {
             .width('100%')
             .height(44)
             .borderRadius(10)
+            .fontFamily(APP_FONT)
             .fontColor(FOREGROUND)
             .backgroundColor(SURFACE)
             .onClick(() => { this.selectKey(); })
@@ -522,12 +536,14 @@ struct Index {
             (value: string) => { this.password = value; })
         }
         if (this.errorText) {
-          Text(this.errorText).fontColor(ERROR).fontSize(14).width('100%').copyOption(CopyOptions.LocalDevice)
+          Text(this.errorText).fontFamily(APP_FONT).fontColor(ERROR).fontSize(14)
+            .width('100%').copyOption(CopyOptions.LocalDevice)
         }
         Button('连接', { type: ButtonType.Normal })
           .width('100%')
           .height(48)
           .borderRadius(10)
+          .fontFamily(APP_FONT)
           .fontSize(16)
           .fontWeight(FontWeight.Medium)
           .fontColor(BACKGROUND)
@@ -550,12 +566,13 @@ struct Index {
       Row({ space: 10 }) {
         Column({ space: 4 }) {
           Text(this.zellijSession.trim() || this.host.trim())
-            .fontSize(17).fontWeight(FontWeight.Medium).fontColor(FOREGROUND).maxLines(1)
+            .fontFamily(APP_FONT).fontSize(17).fontWeight(FontWeight.Medium).fontColor(FOREGROUND).maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(this.statusText).fontSize(12).fontColor(this.connected ? ACCENT : MUTED)
+          Text(this.statusText).fontFamily(APP_FONT).fontSize(12).fontColor(this.connected ? ACCENT : MUTED)
         }.layoutWeight(1).alignItems(HorizontalAlign.Start)
         Button(this.connected ? '断开' : '返回', { type: ButtonType.Normal })
-          .height(34).borderRadius(8).fontSize(13).fontColor(FOREGROUND).backgroundColor(SURFACE)
+          .height(34).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
+          .fontColor(FOREGROUND).backgroundColor(SURFACE)
           .onClick(() => this.backToForm())
       }.width('100%').padding({ left: 12, top: 8, right: 12, bottom: 8 })
       Web({ src: $rawfile('terminal/index.html'), controller: this.view })
@@ -582,11 +599,13 @@ struct Index {
         .onPageEnd(() => this.runTerminalScript('window.nerveTerminal.start()'))
         .onRenderExited(() => this.onTerminalError())
       if (this.errorText) {
-        Text(this.errorText).width('100%').fontColor(ERROR).fontSize(13).padding({ left: 12, right: 12, top: 6 })
+        Text(this.errorText).width('100%').fontFamily(APP_FONT).fontColor(ERROR).fontSize(13)
+          .padding({ left: 12, right: 12, top: 6 })
       }
       Row({ space: 5 }) {
         Button('Ctrl', { type: ButtonType.Normal })
           .layoutWeight(1).padding(0).height(38).borderRadius(8).fontSize(14)
+          .fontFamily(APP_FONT)
           .fontColor(this.ctrlArmed ? BACKGROUND : FOREGROUND)
           .backgroundColor(this.ctrlArmed ? ACCENT : SURFACE)
           .focusOnTouch(false)
