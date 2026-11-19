@@ -159,4 +159,6 @@ Gateway 开始投递其目录中待发送的通知。锁屏正文使用固定模
 
 在 WSL 的 `daemon/` 运行 `npm test`，验证字段映射、并发去重、输入大小、游标、推送事务、掉线重试、双方重启恢复以及 Huawei V3 的签名和响应解析。实机命令行联调使用真实 Codex 0.169.0、OMP 18.22.2 和 Zellij 0.46.0，模型回复由隔离的本地测试服务提供。上表 9 种原生事件均在实际运行中写入 SQLite，其中权限事件发生在 Codex 发出原生审批请求时。通过 `events` 查到各个 Agent 的原生事件后，可用 `panes` 核对 `zellij.paneId`。
 
-推送联调期间先保持 Gateway 离线。三种提醒由真实 Agent 事件触发，并在 Gateway 启动后各入库一次。Huawei V3 发送路径使用本地测试响应验收。Mate 90 Pro1 模拟器已验证系统通知授权，以及模拟点击后经 SSH 进入 WSL 的已有 Zellij 会话。实际 Token 获取与锁屏送达待使用绑定 Push Kit 的调试签名验证。
+推送联调期间先保持 Gateway 离线。三种提醒由真实 Agent 事件触发，并在 Gateway 启动后各入库一次。Huawei V3 的签名和响应处理由本地测试覆盖。Mate 90 Pro1 已验证模拟点击后经 SSH 进入 WSL 上的已有 Zellij 会话。
+
+使用带 Push Kit 权益的签名包，在 HarmonyOS 7.0.0 的 Mate 90 Pro 模拟器取得真实设备令牌。Gateway 发送的测试通知在锁屏期间到达，亮屏后可在通知中心查看，点击打开 Nerve 的关联会话入口。本次通知被归为静默类，锁屏页面未直接显示通知。真机接收仍待验证。
