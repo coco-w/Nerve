@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 #include "ssh_session.h"
 
@@ -76,21 +77,31 @@ napi_value Call(napi_env env, Callback callback)
     }
 }
 
-struct ConnectRequest {
+struct SshRequest {
     nerve::ConnectOptions options {};
+    bool probeOnly = false;
     napi_async_work work = nullptr;
     napi_deferred deferred = nullptr;
     std::unique_ptr<nerve::SshSession> connection;
+    // 探测成功或登录前发现密钥不符时，返回握手得到的实际指纹。
+    std::string observedFingerprint;
     std::string error;
 
-    ~ConnectRequest() { options.ClearCredentials(); }
+    ~SshRequest() { options.ClearCredentials(); }
 };
 
-void ExecuteConnect(napi_env, void *data)
+void ExecuteSshRequest(napi_env, void *data)
 {
-    auto &request = *static_cast<ConnectRequest *>(data);
+    auto &request = *static_cast<SshRequest *>(data);
     try {
-        request.connection = nerve::SshSession::Connect(request.options);
+        if (request.probeOnly) {
+            request.observedFingerprint = nerve::SshSession::ProbeHostKey(request.options.host, request.options.port);
+        } else {
+            request.connection = nerve::SshSession::Connect(request.options);
+        }
+    } catch (const nerve::HostKeyMismatch &error) {
+        request.observedFingerprint = error.fingerprint;
+        request.error = error.what();
     } catch (const std::exception &error) {
         request.error = error.what();
     }
@@ -102,30 +113,72 @@ void FinalizeConnection(napi_env, void *data, void *)
     delete static_cast<nerve::SshSession *>(data);
 }
 
-void CompleteConnect(napi_env env, napi_status status, void *data)
+void CompleteSshRequest(napi_env env, napi_status status, void *data)
 {
-    std::unique_ptr<ConnectRequest> request(static_cast<ConnectRequest *>(data));
+    std::unique_ptr<SshRequest> request(static_cast<SshRequest *>(data));
     napi_value value;
-    if (status == napi_ok && request->connection &&
+    if (status == napi_ok && request->probeOnly && !request->observedFingerprint.empty() &&
+        napi_create_string_utf8(env, request->observedFingerprint.c_str(), NAPI_AUTO_LENGTH, &value) == napi_ok) {
+        napi_resolve_deferred(env, request->deferred, value);
+    } else if (status == napi_ok && request->connection &&
         napi_create_external(env, request->connection.get(), FinalizeConnection, nullptr, &value) == napi_ok) {
         // 连接成功后由 ArkTS 持有句柄，回收时关闭底层套接字。
         request->connection.release();
         napi_resolve_deferred(env, request->deferred, value);
     } else {
-        const char *message = request->error.empty() ? "SSH 连接未能建立。" : request->error.c_str();
+        const char *message = request->probeOnly ? "无法读取 SSH 主机指纹。" : "SSH 连接未能建立。";
+        if (!request->error.empty()) {
+            message = request->error.c_str();
+        }
         napi_value text;
         if (napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &text) == napi_ok &&
             napi_create_error(env, nullptr, text, &value) == napi_ok) {
+            napi_value fingerprint;
+            if (!request->probeOnly && !request->observedFingerprint.empty() &&
+                napi_create_string_utf8(env, request->observedFingerprint.c_str(), NAPI_AUTO_LENGTH,
+                    &fingerprint) == napi_ok) {
+                napi_set_named_property(env, value, "fingerprint", fingerprint);
+            }
             napi_reject_deferred(env, request->deferred, value);
         }
     }
     napi_delete_async_work(env, request->work);
 }
 
+napi_value QueueSshRequest(napi_env env, std::unique_ptr<SshRequest> request, const char *operation)
+{
+    // DNS、握手和认证在后台完成，终端的读写使用非阻塞调用。
+    napi_value promise;
+    napi_value name;
+    Check(napi_create_promise(env, &request->deferred, &promise));
+    Check(napi_create_string_utf8(env, operation, NAPI_AUTO_LENGTH, &name));
+    Check(napi_create_async_work(env, nullptr, name, ExecuteSshRequest, CompleteSshRequest, request.get(),
+        &request->work));
+    const napi_status scheduled = napi_queue_async_work(env, request->work);
+    if (scheduled != napi_ok) {
+        napi_delete_async_work(env, request->work);
+        Check(scheduled);
+    }
+    request.release();
+    return promise;
+}
+
+napi_value ProbeHostKey(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        auto request = std::make_unique<SshRequest>();
+        const napi_value endpoint = Arguments<1>(env, info)[0];
+        request->probeOnly = true;
+        request->options.host = StringProperty(env, endpoint, "host", 253);
+        request->options.port = IntProperty(env, endpoint, "port");
+        return QueueSshRequest(env, std::move(request), "NerveSshProbeHostKey");
+    });
+}
+
 napi_value Connect(napi_env env, napi_callback_info info)
 {
     return Call(env, [&]() {
-        auto request = std::make_unique<ConnectRequest>();
+        auto request = std::make_unique<SshRequest>();
         const napi_value options = Arguments<1>(env, info)[0];
         request->options.host = StringProperty(env, options, "host", 253);
         request->options.port = IntProperty(env, options, "port");
@@ -138,19 +191,7 @@ napi_value Connect(napi_env env, napi_callback_info info)
         request->options.passphrase = StringProperty(env, options, "passphrase", 4096);
         request->options.size = {IntProperty(env, options, "columns"), IntProperty(env, options, "rows")};
 
-        // DNS、握手和认证在后台完成，终端的读写使用非阻塞调用。
-        napi_value promise;
-        napi_value name;
-        Check(napi_create_promise(env, &request->deferred, &promise));
-        Check(napi_create_string_utf8(env, "NerveSshConnect", NAPI_AUTO_LENGTH, &name));
-        Check(napi_create_async_work(env, nullptr, name, ExecuteConnect, CompleteConnect, request.get(), &request->work));
-        const napi_status scheduled = napi_queue_async_work(env, request->work);
-        if (scheduled != napi_ok) {
-            napi_delete_async_work(env, request->work);
-            Check(scheduled);
-        }
-        request.release();
-        return promise;
+        return QueueSshRequest(env, std::move(request), "NerveSshConnect");
     });
 }
 
@@ -220,6 +261,7 @@ napi_value Disconnect(napi_env env, napi_callback_info info)
 napi_value Init(napi_env env, napi_value exports)
 {
     const napi_property_descriptor properties[] = {
+        {"probeHostKey", nullptr, ProbeHostKey, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"connect", nullptr, Connect, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"read", nullptr, Read, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"write", nullptr, Write, nullptr, nullptr, nullptr, napi_default, nullptr},

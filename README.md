@@ -11,8 +11,8 @@ Nerve 是面向 HarmonyOS 的远程开发工具。手机通过 SSH 直连开发�
 ## 手机连接 SSH
 
 1. 确认手机能访问开发机的 SSH 服务。使用运行 Zellij 的同一个远端用户登录。自动附接按 Zellij 0.46.0 联调，要求 `zellij` 位于该用户远端命令的 `PATH` 中。会话名可以用 `zellij list-sessions` 查看。
-2. 在开发机本地核对 SSH 主机公钥。OpenSSH 的常见配置可运行 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256`。把完整的 `SHA256:…` 值填入 Nerve。Nerve 优先协商 Ed25519 主机密钥，服务端使用其他主机密钥时请核对相应的公钥文件。
-3. 填写主机、端口和用户名。可输入密码，或通过文件选择器打开 OpenSSH 或 PEM 私钥并按需输入口令。凭据只用于本次连接。填写已有会话的完整名称可直接附接，留空会打开 Shell，也可在 Shell 中手动运行 `zellij attach <会话名>`。
+2. 填写主机、端口和用户名。可输入密码，或通过文件选择器打开 OpenSSH 或 PEM 私钥并按需输入口令。凭据只用于本次连接。填写已有会话的完整名称可直接附接，留空会打开 Shell，也可在 Shell 中手动运行 `zellij attach <会话名>`。
+3. 首次连接时 Nerve 会显示主机指纹，确认后即可登录。同一主机和端口下次会自动校验已保存的指纹。密钥变化时会阻止登录并显示新旧指纹，核对后可更新信任，再填写凭据连接。需要在开发机核对指纹时，OpenSSH 的常见配置可用 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256`。Nerve 优先协商 Ed25519，服务端使用其他密钥时请核对对应的公钥文件。
 4. 点击终端弹出软键盘。底部提供 Ctrl、Esc、Tab 和方向键。点一次 Ctrl 再输入字母可发送组合键。窗口尺寸变化时会同步给主机。点击「断开」退出当前 SSH 连接，已有 Zellij 会话继续运行。
 
 ### 构建与联调
@@ -30,7 +30,7 @@ cmake --build /tmp/nerve-ssh-build --target nerve_ssh_smoke --parallel
 /tmp/nerve-ssh-build/nerve_ssh_smoke 主机 端口 用户 SHA256:指纹 私钥文件 测试会话名
 ~~~
 
-如测试私钥带口令，可通过 `NERVE_SMOKE_KEY_PASSPHRASE` 传入。联调覆盖错误指纹、私钥登录、UTF-8 交互、终端尺寸同步和已有会话附接。
+如测试私钥带口令，可通过 `NERVE_SMOKE_KEY_PASSPHRASE` 传入。联调覆盖首次指纹探测、错误指纹、私钥登录、UTF-8 交互、终端尺寸同步和已有会话附接。
 
 ## 运行 Daemon
 

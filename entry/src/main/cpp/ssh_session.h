@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <sys/types.h>
 
@@ -32,8 +33,18 @@ struct ConnectOptions {
     void ClearCredentials();
 };
 
+// 携带本次握手的指纹，供界面显示并让用户核对主机密钥变化。
+class HostKeyMismatch final : public std::runtime_error {
+public:
+    explicit HostKeyMismatch(const std::string &observed)
+        : std::runtime_error("SSH 主机密钥已变化。"), fingerprint(observed) {}
+
+    const std::string fingerprint;
+};
+
 class SshSession final {
 public:
+    static std::string ProbeHostKey(const std::string &host, int port);
     static std::unique_ptr<SshSession> Connect(const ConnectOptions &options);
     ~SshSession();
 
@@ -48,7 +59,8 @@ public:
 
 private:
     SshSession() = default;
-    void VerifyFingerprint(const std::string &expected) const;
+    static std::unique_ptr<SshSession> Handshake(const std::string &host, int port);
+    std::string Fingerprint() const;
     void Authenticate(const ConnectOptions &options) const;
     void OpenPty(const ConnectOptions &options);
     void RequireOpen() const;

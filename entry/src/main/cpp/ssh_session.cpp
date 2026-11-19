@@ -117,8 +117,8 @@ void ConnectOptions::ClearCredentials()
 
 std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
 {
-    if (options.host.empty() || options.username.empty() || options.port < 1 || options.port > 65535) {
-        throw std::runtime_error("请检查 SSH 地址、端口和用户名。");
+    if (options.username.empty() || options.fingerprint.empty()) {
+        throw std::runtime_error("SSH 登录需要用户名和已信任的主机密钥。");
     }
     if (!IsSessionName(options.zellijSession)) {
         throw std::runtime_error("Zellij 会话名含有不支持的字符。");
@@ -128,12 +128,35 @@ std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
     }
     ValidateSize(options.size);
 
+    auto connection = Handshake(options.host, options.port);
+    // 首次信任后的新握手也必须校验指纹，且在发出任何认证请求之前比较。
+    const std::string observed = connection->Fingerprint();
+    if (observed != options.fingerprint) {
+        throw HostKeyMismatch(observed);
+    }
+    connection->Authenticate(options);
+    connection->OpenPty(options);
+    libssh2_session_set_blocking(connection->session_, 0);
+    return connection;
+}
+
+std::string SshSession::ProbeHostKey(const std::string &host, int port)
+{
+    // 首次连接只进行握手和取指纹，随后关闭临时连接。
+    return Handshake(host, port)->Fingerprint();
+}
+
+std::unique_ptr<SshSession> SshSession::Handshake(const std::string &host, int port)
+{
+    if (host.empty() || host.find('\0') != std::string::npos || port < 1 || port > 65535) {
+        throw std::runtime_error("请检查 SSH 主机地址和端口。");
+    }
     static const int initResult = libssh2_init(0);
     if (initResult != 0) {
         throw std::runtime_error("SSH 库初始化失败。");
     }
     auto connection = std::unique_ptr<SshSession>(new SshSession());
-    connection->socket_ = ConnectSocket(options.host, options.port);
+    connection->socket_ = ConnectSocket(host, port);
     connection->session_ = libssh2_session_init();
     if (!connection->session_) {
         throw std::runtime_error("无法分配 SSH 会话。");
@@ -147,15 +170,10 @@ std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
     if (libssh2_session_handshake(connection->session_, connection->socket_) != 0) {
         throw std::runtime_error("SSH 握手失败，请检查服务端是否支持 SSH。");
     }
-    // 在发出任何用户认证请求之前校验握手使用的主机公钥。
-    connection->VerifyFingerprint(options.fingerprint);
-    connection->Authenticate(options);
-    connection->OpenPty(options);
-    libssh2_session_set_blocking(connection->session_, 0);
     return connection;
 }
 
-void SshSession::VerifyFingerprint(const std::string &expected) const
+std::string SshSession::Fingerprint() const
 {
     const char *digest = libssh2_hostkey_hash(session_, LIBSSH2_HOSTKEY_HASH_SHA256);
     if (!digest) {
@@ -164,10 +182,7 @@ void SshSession::VerifyFingerprint(const std::string &expected) const
     // 与 OpenSSH ssh-keygen -E sha256 输出一致，省略 Base64 末尾的等号。
     std::array<unsigned char, 45> encoded {};
     EVP_EncodeBlock(encoded.data(), reinterpret_cast<const unsigned char *>(digest), 32);
-    const std::string observed = "SHA256:" + std::string(reinterpret_cast<const char *>(encoded.data()), 43);
-    if (expected != observed) {
-        throw std::runtime_error("主机指纹不匹配。请在主机上核对后重试。收到的指纹：" + observed);
-    }
+    return "SHA256:" + std::string(reinterpret_cast<const char *>(encoded.data()), 43);
 }
 
 void SshSession::Authenticate(const ConnectOptions &options) const

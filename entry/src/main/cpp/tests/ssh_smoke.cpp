@@ -53,15 +53,19 @@ void Send(nerve::SshSession &session, const std::string &input)
 void CheckFingerprint(nerve::ConnectOptions &options)
 {
     const std::string expected = options.fingerprint;
+    // 以 OpenSSH 生成的指纹为准，核对探测与登录握手使用同一把主机密钥。
+    if (nerve::SshSession::ProbeHostKey(options.host, options.port) != expected) {
+        throw std::runtime_error("首次连接探测得到的主机指纹不匹配。");
+    }
     options.fingerprint[7] = options.fingerprint[7] == 'A' ? 'B' : 'A';
     try {
         nerve::SshSession::Connect(options);
-    } catch (const std::exception &error) {
+    } catch (const nerve::HostKeyMismatch &error) {
         options.fingerprint = expected;
-        if (std::string(error.what()).find("主机指纹不匹配") == 0) {
-            return;
+        if (error.fingerprint != expected) {
+            throw std::runtime_error("密钥变化提示未返回本次握手的实际指纹。");
         }
-        throw;
+        return;
     }
     throw std::runtime_error("错误的主机指纹被接受。");
 }

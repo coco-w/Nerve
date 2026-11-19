@@ -1,8 +1,10 @@
 import { webview } from '@kit.ArkWeb';
+import { preferences } from '@kit.ArkData';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
-import { connect, disconnect, read, resize, SshConnectOptions, SshHandle, write } from 'libnerve_ssh.so';
+import { connect, disconnect, probeHostKey, read, resize, SshConnectOptions, SshError, SshHandle, write }
+  from 'libnerve_ssh.so';
 import { PushSettings } from '../push/PushSettings';
 import { ACCENT, APP_FONT, BACKGROUND, ERROR, FOREGROUND, MUTED, SURFACE } from '../ui/Theme';
 
@@ -14,10 +16,19 @@ const POLL_MS = 30;
 const MAX_CHUNK_BYTES = 16 * 1024;
 const MAX_QUEUED_BYTES = 64 * 1024;
 const MAX_KEY_BYTES = 32 * 1024;
+// 应用本地的 SSH 信任记录，按主机和端口保存指纹。
+const KNOWN_HOSTS_STORE = 'nerve_known_hosts';
 
 interface PtySize {
   columns: number;
   rows: number;
+}
+
+interface HostKeyReview {
+  host: string;
+  port: number;
+  observed: string;
+  previous: string;
 }
 
 // 渲染层只传终端输入、尺寸和渲染确认，连接信息及凭据由 ArkTS 持有。
@@ -61,12 +72,13 @@ struct Index {
   @State private host: string = '';
   @State private port: string = '22';
   @State private username: string = '';
-  @State private fingerprint: string = '';
   @State private zellijSession: string = '';
   @State private usePrivateKey: boolean = false;
   @State private keySelected: boolean = false;
   @State private password: string = '';
   @State private passphrase: string = '';
+  @State private checkingHostKey: boolean = false;
+  @State private hostKeyReview: HostKeyReview | undefined = undefined;
   @State private terminalVisible: boolean = false;
   @State private connected: boolean = false;
   @State private statusText: string = '';
@@ -83,6 +95,8 @@ struct Index {
   // 连接代次会在退出时增加，丢弃此前未完成的握手和渲染回调。
   private generation: number = 0;
   private connection: SshHandle | undefined;
+  // 首次确认前暂存本次表单，取消后丢弃，凭据始终留在内存中。
+  private pendingTrustConnection: SshConnectOptions | undefined;
   private pendingConnection: SshConnectOptions | undefined;
   private loadTimer: number = -1;
   private ioTimer: number = -1;
@@ -103,6 +117,15 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    if (this.hostKeyReview) {
+      this.cancelHostKeyReview();
+      return true;
+    }
+    if (this.checkingHostKey) {
+      this.generation++;
+      this.checkingHostKey = false;
+      return true;
+    }
     if (this.pushSettingsVisible) {
       this.pushSettingsVisible = false;
       return true;
@@ -123,6 +146,9 @@ struct Index {
       this.getUIContext().setKeyboardAvoidMode(this.formKeyboardMode);
     }
     this.stopConnection();
+    this.pendingTrustConnection = undefined;
+    this.hostKeyReview = undefined;
+    this.checkingHostKey = false;
     this.clearCredentials();
   }
 
@@ -183,23 +209,35 @@ struct Index {
     }
   }
 
-  private startConnection(): void {
-    if (this.terminalVisible) {
+  private knownHostId(host: string, port: number): string {
+    // DNS 大小写共用信任记录，IPv6 保留接口作用域名称。
+    return host.includes(':') ? `[${host}]:${port}` : `${host.toLowerCase()}:${port}`;
+  }
+
+  private async openKnownHosts(): Promise<preferences.Preferences> {
+    const context = this.getUIContext().getHostContext();
+    if (!context) {
+      throw new Error('无法访问本机的 SSH 信任记录。');
+    }
+    try {
+      return await preferences.getPreferences(context, { name: KNOWN_HOSTS_STORE });
+    } catch (_) {
+      throw new Error('无法打开本机的 SSH 信任记录。');
+    }
+  }
+
+  private async startConnection(): Promise<void> {
+    if (this.terminalVisible || this.hostKeyReview || this.checkingHostKey) {
       return;
     }
     const host = this.host.trim().replace(/^\[([^\]]+)\]$/, '$1');
     const username = this.username.trim();
     const port = Number(this.port);
-    const fingerprint = this.fingerprint.trim();
     // 通知只引用本地事件，通过已校验指纹的 SSH 连接到对应开发机后才解析会话。
     const pushLink = this.pushLink;
     const session = pushLink ? '' : this.zellijSession.trim();
     if (!host || !username || !/^\d{1,5}$/.test(this.port) || port < 1 || port > 65535) {
       this.errorText = '请填写主机地址、用户名和 1–65535 范围内的端口。';
-      return;
-    }
-    if (!/^SHA256:[A-Za-z0-9+/]{43}$/.test(fingerprint)) {
-      this.errorText = '请输入主机公钥的完整 SHA256 指纹。';
       return;
     }
     if (session && !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(session)) {
@@ -211,11 +249,96 @@ struct Index {
       return;
     }
 
-    this.pendingConnection = {
-      host, port, username, fingerprint, password: this.password, privateKey: this.privateKey,
+    const options: SshConnectOptions = {
+      host, port, username, fingerprint: '', password: this.password, privateKey: this.privateKey,
       passphrase: this.passphrase, zellijSession: session, pushLink, columns: 80, rows: 24
     };
-    this.openedPushLink = pushLink;
+    const generation = ++this.generation;
+    this.checkingHostKey = true;
+    this.errorText = '';
+    try {
+      const knownHosts = await this.openKnownHosts();
+      const saved = await knownHosts.get(this.knownHostId(host, port), '');
+      if (this.generation !== generation) {
+        return;
+      }
+      if (typeof saved === 'string' && saved) {
+        options.fingerprint = saved;
+        this.beginConnection(options);
+        return;
+      }
+      // 首次握手只取指纹，确认前不向主机发送用户名或凭据。
+      const observed = await probeHostKey({ host, port });
+      if (this.generation === generation) {
+        this.pendingTrustConnection = options;
+        this.hostKeyReview = { host, port, observed, previous: '' };
+      }
+    } catch (error) {
+      if (this.generation === generation) {
+        this.errorText = (error as Error).message || '无法核对 SSH 主机密钥。';
+      }
+    } finally {
+      if (this.generation === generation) {
+        this.checkingHostKey = false;
+      }
+    }
+  }
+
+  private cancelHostKeyReview(): void {
+    if (!this.checkingHostKey) {
+      this.pendingTrustConnection = undefined;
+      this.hostKeyReview = undefined;
+      this.errorText = '';
+    }
+  }
+
+  private async confirmHostKey(): Promise<void> {
+    const review = this.hostKeyReview;
+    if (!review || this.checkingHostKey) {
+      return;
+    }
+    const generation = this.generation;
+    this.checkingHostKey = true;
+    this.errorText = '';
+    try {
+      const knownHosts = await this.openKnownHosts();
+      if (this.generation !== generation) {
+        return;
+      }
+      const id = this.knownHostId(review.host, review.port);
+      await knownHosts.put(id, review.observed);
+      try {
+        await knownHosts.flush();
+      } catch (_) {
+        // 写入失败时恢复内存中的旧记录，避免把未持久化的指纹当作已保存。
+        knownHosts.putSync(id, review.previous);
+        throw new Error('无法保存主机密钥。');
+      }
+      if (this.generation !== generation) {
+        return;
+      }
+      const options = this.pendingTrustConnection;
+      this.pendingTrustConnection = undefined;
+      this.hostKeyReview = undefined;
+      if (options) {
+        options.fingerprint = review.observed;
+        this.beginConnection(options);
+      }
+    } catch (_) {
+      if (this.generation === generation) {
+        this.errorText = '无法保存主机密钥，请重试。';
+      }
+    } finally {
+      if (this.generation === generation) {
+        this.checkingHostKey = false;
+      }
+    }
+  }
+
+  private beginConnection(options: SshConnectOptions): void {
+    this.checkingHostKey = false;
+    this.pendingConnection = options;
+    this.openedPushLink = options.pushLink;
     this.clearCredentials();
     this.errorText = '';
     const generation = ++this.generation;
@@ -281,7 +404,16 @@ struct Index {
       this.ioTimer = setInterval(() => this.pumpTerminal(), POLL_MS);
     } catch (error) {
       if (this.generation === generation) {
-        this.failOpening((error as Error).message || 'SSH 连接失败。');
+        const failure = error as SshError;
+        if (failure.fingerprint) {
+          // 原生层已在用户认证前断开，须明确确认新密钥才能再次登录。
+          this.backToForm();
+          this.hostKeyReview = {
+            host: options.host, port: options.port, observed: failure.fingerprint, previous: options.fingerprint
+          };
+        } else {
+          this.failOpening(failure.message || 'SSH 连接失败。');
+        }
       }
     }
   }
@@ -537,8 +669,6 @@ struct Index {
               (value: string) => { this.port = value; })
           }.layoutWeight(1)
         }.width('100%')
-        this.field('主机指纹', this.fingerprint, 'SHA256:…', InputType.Normal, 64,
-          (value: string) => { this.fingerprint = value; })
         if (!this.pushLink) {
           this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
             (value: string) => { this.zellijSession = value; })
@@ -566,7 +696,8 @@ struct Index {
           Text(this.errorText).fontFamily(APP_FONT).fontColor(ERROR).fontSize(14)
             .width('100%').copyOption(CopyOptions.LocalDevice)
         }
-        Button(this.pushLink ? '连接并打开会话' : '连接', { type: ButtonType.Normal })
+        Button(this.checkingHostKey ? '正在核对主机' : this.pushLink ? '连接并打开会话' : '连接',
+          { type: ButtonType.Normal })
           .width('100%')
           .height(48)
           .borderRadius(10)
@@ -581,10 +712,57 @@ struct Index {
       .alignItems(HorizontalAlign.Start)
       .constraintSize({ maxWidth: 540 })
       .width('100%')
+      .enabled(!this.checkingHostKey)
     }
     .width('100%')
     .height('100%')
     .align(Alignment.Top)
+  }
+
+  @Builder
+  hostKeyFingerprint(label: string, value: string) {
+    Column({ space: 6 }) {
+      Text(label).fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
+      Text(value).fontFamily(APP_FONT).fontSize(14).fontColor(FOREGROUND)
+        .wordBreak(WordBreak.BREAK_ALL).copyOption(CopyOptions.LocalDevice)
+    }.width('100%').alignItems(HorizontalAlign.Start).padding(12).borderRadius(10).backgroundColor(SURFACE)
+  }
+
+  @Builder
+  reviewHostKey(review: HostKeyReview) {
+    Scroll() {
+      Column({ space: 14 }) {
+        Text(review.previous ? 'SSH 主机密钥已变化' : '首次连接此主机')
+          .fontFamily(APP_FONT).fontSize(24).fontWeight(FontWeight.Bold)
+          .fontColor(review.previous ? ERROR : FOREGROUND)
+        Text(this.knownHostId(review.host, review.port)).fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
+          .wordBreak(WordBreak.BREAK_ALL)
+        Text(review.previous ? '连接已阻止。请在开发机或可信渠道核对新指纹。更新信任后，需要重新填写 SSH 凭据。' :
+          '请确认这是你的开发机。确认后，Nerve 会在此设备记住它的主机密钥。')
+          .fontFamily(APP_FONT).fontSize(14).fontColor(MUTED)
+        if (review.previous) {
+          this.hostKeyFingerprint('已保存的指纹', review.previous)
+        }
+        this.hostKeyFingerprint(review.previous ? '新指纹' : '主机指纹', review.observed)
+        if (this.errorText) {
+          Text(this.errorText).fontFamily(APP_FONT).fontSize(14).fontColor(ERROR)
+        }
+        Row({ space: 10 }) {
+          Button('取消', { type: ButtonType.Normal })
+            .layoutWeight(1).height(44).borderRadius(10).fontFamily(APP_FONT).fontSize(15)
+            .fontColor(FOREGROUND).backgroundColor(SURFACE)
+            .onClick(() => this.cancelHostKeyReview())
+          Button(review.previous ? '更新信任' : '信任并连接', { type: ButtonType.Normal })
+            .layoutWeight(1).height(44).borderRadius(10).fontFamily(APP_FONT).fontSize(15)
+            .fontColor(BACKGROUND).backgroundColor(ACCENT)
+            .onClick(() => this.confirmHostKey())
+        }.width('100%').enabled(!this.checkingHostKey)
+      }
+      .width('100%')
+      .constraintSize({ maxWidth: 540 })
+      .padding({ left: 20, top: 24, right: 20, bottom: 28 })
+      .alignItems(HorizontalAlign.Start)
+    }.width('100%').height('100%').align(Alignment.Top)
   }
 
   @Builder
@@ -661,6 +839,8 @@ struct Index {
     Column() {
       if (this.terminalVisible) {
         this.terminalView()
+      } else if (this.hostKeyReview) {
+        this.reviewHostKey(this.hostKeyReview)
       } else if (this.pushSettingsVisible) {
         PushSettings({ onClose: () => { this.pushSettingsVisible = false; } })
       } else {
