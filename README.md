@@ -96,9 +96,22 @@ omp -e /mnt/d/Huawei/Nerve/daemon/adapters/omp/extension.ts
 
 ## 推送通知
 
-### Daemon 与 Gateway 联调
+### 多台开发机共用一个 Gateway
 
-Push Gateway 与 Daemon 使用同一份 Node.js 构建产物，各自运行。先在 `daemon/` 运行 `npm ci` 和 `npm run build`。在两个进程的启动环境中设置同一个 `NERVE_GATEWAY_TOKEN`，可用 `openssl rand -hex 32` 生成。
+每台要发送 Codex 或 OMP 提醒的开发机运行 Nerve Daemon，统一把通知送到一台常开的 Push Gateway。Gateway 再调用 Huawei Push Kit 通知手机。`npm start` 启动 Daemon，`npm run gateway` 启动 Gateway。两个入口都位于 `daemon/`，可部署到不同机器。
+
+| 运行位置 | 推送配置 |
+| --- | --- |
+| 每台需要发通知的开发机 | `NERVE_GATEWAY_URL` 指向同一个网关的 `/v1/notifications`，`NERVE_GATEWAY_TOKEN` 用于向网关鉴权 |
+| Push Gateway 所在机器 | 设置相同的 `NERVE_GATEWAY_TOKEN`，并在这一台配置华为服务账号 JSON 和手机的 Push Token |
+
+Gateway 默认监听 `127.0.0.1:8787`。跨机器使用时，在网关所在机器用 HTTPS 反向代理提供 `POST /v1/notifications`。开发机可经内网或 VPN 访问时，可使用该网络内的 HTTPS 地址。分散在不同网络且无法经私网访问时，可使用公网 HTTPS 地址。当前网关的通知统一投递到配置的一个手机 Push Token。
+
+在手机上添加 SSH 服务器时，只需要填写 SSH 连接信息。点推送通知时，手机仍通过 SSH 直连触发通知的开发机。
+
+### 本机联调
+
+先在 `daemon/` 运行 `npm ci` 和 `npm run build`。在两个进程的启动环境中设置同一个 `NERVE_GATEWAY_TOKEN`，可用 `openssl rand -hex 32` 生成。
 
 在 Gateway 的终端运行以下命令。临时目录用于本地联调，通常部署时用 `~/.nerve-gateway` 或通过 `NERVE_GATEWAY_HOME` 指定私有目录（`0700`）。监听端口默认是 `8787`，可通过 `NERVE_GATEWAY_PORT` 设置。
 
@@ -106,7 +119,7 @@ Push Gateway 与 Daemon 使用同一份 Node.js 构建产物，各自运行。�
 NERVE_GATEWAY_HOME="$(mktemp -d)" npm run gateway
 ~~~
 
-在 Daemon 的终端运行以下命令。Daemon 和 Agent 进程使用同一个 `NERVE_HOME`。跨主机时，在 Gateway 前部署 HTTPS 反向代理，把 `NERVE_GATEWAY_URL` 改成代理提供的通知地址。Gateway 本身监听 `127.0.0.1`。
+在 Daemon 的终端运行以下命令。Daemon 和 Agent 进程使用同一个 `NERVE_HOME`。
 
 ~~~bash
 export NERVE_HOME="$(mktemp -d)"
@@ -139,7 +152,7 @@ curl -fsS -H "Authorization: Bearer $NERVE_GATEWAY_TOKEN" http://127.0.0.1:8787/
 
 1. 在 DevEco Studio 为与 AppGallery Connect 注册应用相同的包名启用 Push Kit，并更新调试签名后安装。Nerve 当前包名为 `com.example.nerve`。 [开通与调试签名](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-config-setting)
 2. 在 Nerve 连接页点击「推送通知」，允许系统通知，再点「获取令牌」和「保存令牌到文件」。将文件从手机传到运行 Gateway 的电脑，在启动环境中从文件读取 `NERVE_HUAWEI_PUSH_TOKEN`。 [华为获取 Push Token 指南](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/push-get-token/)
-3. 配置 Gateway 的两项华为凭据。比如在 WSL 用下面的命令从私有目录读取文件，再按前面的方式启动 Gateway。
+3. 在运行 Gateway 的机器上配置两项华为凭据。Gateway 在 WSL 联调时，可以从 WSL 的 `~/.nerve-gateway` 读取文件，再按前面的方式启动。
 
 ~~~bash
 export NERVE_HUAWEI_SERVICE_ACCOUNT_FILE="$HOME/.nerve-gateway/huawei-service-account.json"
