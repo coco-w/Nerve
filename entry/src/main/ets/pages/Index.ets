@@ -45,6 +45,12 @@ interface SshOpenRequest {
   server?: SavedSshServer;
 }
 
+interface NerveOptionButtonParams {
+  label: string;
+  selected: boolean;
+  onSelect: () => void;
+}
+
 interface MoshBridgeCallbacks {
   wasm: (offset: number) => string;
   key: () => string;
@@ -1057,16 +1063,17 @@ struct Index {
   }
 
   @Builder
-  optionButton(label: string, selected: boolean, action: () => void) {
-    Button(label, { type: ButtonType.Normal })
+  optionButton($$: NerveOptionButtonParams) {
+    // 按引用读取选中状态，切换时同步刷新按钮和输入项。
+    Button($$.label, { type: ButtonType.Normal })
       .layoutWeight(1)
       .height(38)
       .borderRadius(8)
       .fontFamily(APP_FONT)
       .fontSize(14)
-      .fontColor(selected ? BACKGROUND : FOREGROUND)
-      .backgroundColor(selected ? ACCENT : SURFACE)
-      .onClick(action)
+      .fontColor($$.selected ? BACKGROUND : FOREGROUND)
+      .backgroundColor($$.selected ? ACCENT : SURFACE)
+      .onClick($$.onSelect)
   }
 
   @Builder
@@ -1168,16 +1175,16 @@ struct Index {
     this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
       (value: string) => { this.zellijSession = value; })
     Row({ space: 8 }) {
-      this.optionButton('SSH', !this.useMosh, () => { this.useMosh = false; })
-      this.optionButton('Mosh', this.useMosh, () => { this.useMosh = true; })
+      this.optionButton({ label: 'SSH', selected: !this.useMosh, onSelect: () => { this.useMosh = false; } })
+      this.optionButton({ label: 'Mosh', selected: this.useMosh, onSelect: () => { this.useMosh = true; } })
     }.width('100%')
     if (this.useMosh) {
       this.field('Mosh UDP 端口', this.moshPortInput, '可选 · 自动分配', InputType.Number, 5,
         (value: string) => { this.moshPortInput = value; })
     }
     Row({ space: 8 }) {
-      this.optionButton('密码', !this.usePrivateKey, () => this.changeAuth(false))
-      this.optionButton('私钥', this.usePrivateKey, () => this.changeAuth(true))
+      this.optionButton({ label: '密码', selected: !this.usePrivateKey, onSelect: () => this.changeAuth(false) })
+      this.optionButton({ label: '私钥', selected: this.usePrivateKey, onSelect: () => this.changeAuth(true) })
     }.width('100%')
     if (this.usePrivateKey) {
       Button(this.keySelected ? '已选私钥 · 更换' : this.canKeepSavedCredentials() ? '已保存私钥 · 更换' : '选择私钥文件',
