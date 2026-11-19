@@ -186,12 +186,29 @@ napi_value Connect(napi_env env, napi_callback_info info)
         request->options.fingerprint = StringProperty(env, options, "fingerprint", 50);
         request->options.zellijSession = StringProperty(env, options, "zellijSession", 128);
         request->options.pushLink = StringProperty(env, options, "pushLink", 73);
+        bool discoverProvided = false;
+        Check(napi_has_named_property(env, options, "discoverDaemon", &discoverProvided));
+        if (discoverProvided) {
+            napi_value discover;
+            Check(napi_get_named_property(env, options, "discoverDaemon", &discover));
+            Check(napi_get_value_bool(env, discover, &request->options.discoverDaemon));
+        }
         request->options.password = StringProperty(env, options, "password", 4096);
         request->options.privateKey = StringProperty(env, options, "privateKey", 32768);
         request->options.passphrase = StringProperty(env, options, "passphrase", 4096);
         request->options.size = {IntProperty(env, options, "columns"), IntProperty(env, options, "rows")};
 
         return QueueSshRequest(env, std::move(request), "NerveSshConnect");
+    });
+}
+
+napi_value DaemonHealth(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        const auto &health = Connection(env, Arguments<1>(env, info)[0]).DaemonHealth();
+        napi_value value;
+        Check(napi_create_string_utf8(env, health.data(), health.size(), &value));
+        return value;
     });
 }
 
@@ -215,6 +232,16 @@ napi_value Read(napi_env env, napi_callback_info info)
             std::memcpy(target, bytes.data(), length);
         }
         return value;
+    });
+}
+
+napi_value ExitStatus(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        const auto status = Connection(env, Arguments<1>(env, info)[0]).ExitStatus();
+        napi_value result;
+        Check(napi_create_int32(env, status, &result));
+        return result;
     });
 }
 
@@ -263,7 +290,9 @@ napi_value Init(napi_env env, napi_value exports)
     const napi_property_descriptor properties[] = {
         {"probeHostKey", nullptr, ProbeHostKey, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"connect", nullptr, Connect, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"daemonHealth", nullptr, DaemonHealth, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"read", nullptr, Read, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"exitStatus", nullptr, ExitStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"write", nullptr, Write, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resize", nullptr, Resize, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"disconnect", nullptr, Disconnect, nullptr, nullptr, nullptr, napi_default, nullptr},

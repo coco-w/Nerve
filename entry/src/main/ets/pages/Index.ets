@@ -3,8 +3,9 @@ import { preferences } from '@kit.ArkData';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
-import { connect, disconnect, probeHostKey, read, resize, SshConnectOptions, SshError, SshHandle, write }
-  from 'libnerve_ssh.so';
+import { connect, daemonHealth, disconnect, exitStatus, probeHostKey, read, resize, SshConnectOptions, SshError,
+  SshHandle, write } from 'libnerve_ssh.so';
+import { hostIdFromDaemonHealth } from '../push/PushLink';
 import { PushSettings } from '../push/PushSettings';
 import { SavedSshServer, SshCredentials, SshServerSettings, SshServerStore } from '../ssh/SshServerStore';
 import { ACCENT, APP_FONT, BACKGROUND, ERROR, FOREGROUND, MUTED, SURFACE } from '../ui/Theme';
@@ -17,6 +18,8 @@ const POLL_MS = 30;
 const MAX_CHUNK_BYTES = 16 * 1024;
 const MAX_QUEUED_BYTES = 64 * 1024;
 const MAX_KEY_BYTES = 32 * 1024;
+// nerve attach-event 用此状态报告原 Zellij 会话已关闭。
+const SESSION_UNAVAILABLE_EXIT_STATUS = 20;
 // 应用本地的 SSH 信任记录，按主机和端口保存指纹。
 const KNOWN_HOSTS_STORE = 'nerve_known_hosts';
 
@@ -77,7 +80,8 @@ struct Index {
   @State private pushSettingsVisible: boolean = false;
   @State private openedPushLink: string = '';
   @State private openedRemoteTitle: string = '';
-  @State private savedServers: SavedSshServer[] = [];
+  @State @Watch('updateNotificationMatch') private savedServers: SavedSshServer[] = [];
+  @State private notificationServer: SavedSshServer | undefined = undefined;
   @State private editingServer: SavedSshServer | undefined = undefined;
   @State private serverEditorOpen: boolean = false;
   @State private managingServers: boolean = false;
@@ -93,6 +97,7 @@ struct Index {
   @State private checkingHostKey: boolean = false;
   @State private hostKeyReview: HostKeyReview | undefined = undefined;
   @State private terminalVisible: boolean = false;
+  @State private terminalInstance: number = 0;
   @State private connected: boolean = false;
   @State private statusText: string = '';
   @State private errorText: string = '';
@@ -119,6 +124,7 @@ struct Index {
   private queuedBytes: number = 0;
   private writePending: boolean = false;
   private renderPending: boolean = false;
+  private receivedTerminalOutput: boolean = false;
   private latestSize: PtySize = { columns: 80, rows: 24 };
   private sentSize: PtySize = { columns: 80, rows: 24 };
   private resizePending: PtySize | undefined;
@@ -161,6 +167,41 @@ struct Index {
 
   private onPushLinkChanged(): void {
     if (this.pushLink) this.pushSettingsVisible = false;
+    this.updateNotificationMatch();
+  }
+
+  private updateNotificationMatch(): void {
+    const daemonHostId = this.pushLink.slice(0, 36);
+    // 同一 Daemon 有多个 SSH 登录方式时保留手选入口，避免猜测用户希望使用哪条连接。
+    const matches = daemonHostId ? this.savedServers.filter((server: SavedSshServer): boolean =>
+      server.daemonHostId === daemonHostId) : [];
+    this.notificationServer = matches.length === 1 ? matches[0] : undefined;
+  }
+
+  private openMatchedNotification(): void {
+    const server = this.notificationServer;
+    const link = this.pushLink;
+    if (!server || !link || this.managingServers || this.checkingHostKey) {
+      return;
+    }
+    if (this.terminalVisible) {
+      this.backToForm();
+    }
+    // 收到或点击系统通知只选中服务器，由用户点「打开会话」后才读取凭据。
+    this.startConnection(server, link);
+  }
+
+  private useSavedServer(id: number, edit: boolean): void {
+    // 列表行用稳定 ID 复用，操作时读取最新配置和通知绑定。
+    const server = this.savedServers.find((item: SavedSshServer): boolean => item.id === id);
+    if (!server) {
+      return;
+    }
+    if (edit) {
+      this.setServerEditor(true, server);
+    } else {
+      this.startConnection(server, this.notificationServer ? '' : this.pushLink);
+    }
   }
 
   aboutToDisappear(): void {
@@ -266,7 +307,8 @@ struct Index {
       this.errorText = server.usePrivateKey ? '请选择 SSH 私钥。' : '请输入 SSH 密码。';
       return;
     }
-    const editingId = this.editingServer?.id;
+    const editing = this.editingServer;
+    const editingId = editing?.id;
     this.managingServers = true;
     this.errorText = '';
     try {
@@ -280,7 +322,7 @@ struct Index {
         this.errorText = '该服务器账号已保存，请在列表中编辑。';
         return;
       }
-      const saved = await storage.save(server, credentials, editingId);
+      const saved = await storage.save(server, credentials, editing);
       this.savedServers = editingId === undefined ? [saved, ...this.savedServers] :
         this.savedServers.map((item: SavedSshServer): SavedSshServer => item.id === saved.id ? saved : item);
       this.setServerEditor(false);
@@ -388,12 +430,11 @@ struct Index {
     }
   }
 
-  private startConnection(server?: SavedSshServer): void {
+  private startConnection(server?: SavedSshServer, pushLink: string = ''): void {
     if (this.terminalVisible || this.hostKeyReview || this.checkingHostKey || this.managingServers) {
       return;
     }
     // 通知只引用本地事件，通过已校验指纹的 SSH 连接到对应开发机后才解析会话。
-    const pushLink = this.pushLink;
     const settings = server ?? this.formSettings(!pushLink);
     if (!settings) {
       return;
@@ -407,7 +448,9 @@ struct Index {
       host: settings.host, port: settings.port, username: settings.username, fingerprint: '',
       password: credentials?.password ?? '', privateKey: credentials?.privateKey ?? '',
       passphrase: credentials?.passphrase ?? '', zellijSession: pushLink ? '' : settings.zellijSession,
-      pushLink, columns: 80, rows: 24
+      pushLink, columns: 80, rows: 24,
+      // 已匹配的通知由 attach-event 再校验主机，普通连接和手动选择会刷新绑定。
+      discoverDaemon: server !== undefined && (!pushLink || server.daemonHostId !== pushLink.slice(0, 36))
     };
     this.prepareConnection({ options, server });
   }
@@ -501,14 +544,18 @@ struct Index {
   private beginConnection(request: SshOpenRequest): void {
     this.checkingHostKey = false;
     this.pendingConnection = request;
+    this.receivedTerminalOutput = false;
     this.openedPushLink = request.options.pushLink;
-    this.openedRemoteTitle = request.options.zellijSession || request.options.host;
+    this.openedRemoteTitle = request.options.zellijSession || (request.options.pushLink ?
+      this.knownHostId(request.options.host, request.options.port) : request.options.host);
     this.clearCredentials();
     this.errorText = '';
     const generation = ++this.generation;
     this.statusText = '正在打开终端';
     this.view = new webview.WebviewController();
     this.bridge = this.createBridge(generation);
+    // 同一帧内切换服务器时也重建 Web 终端，使控制器和原生桥接与新连接一致。
+    this.terminalInstance = generation;
     // 键盘弹出时调整整个终端视图，快捷键栏留在键盘上方。
     const context = this.getUIContext();
     this.formKeyboardMode = context.getKeyboardAvoidMode();
@@ -580,6 +627,9 @@ struct Index {
       this.connected = true;
       this.statusText = 'SSH 已连接';
       this.ioTimer = setInterval(() => this.pumpTerminal(), POLL_MS);
+      if (request.server && options.discoverDaemon) {
+        this.rememberDaemonHost(request.server, connection);
+      }
     } catch (error) {
       if (this.generation === generation) {
         const failure = error as SshError;
@@ -587,6 +637,8 @@ struct Index {
           // 原生层已在用户认证前断开，须明确确认新密钥才能再次登录。
           this.backToForm();
           this.pendingTrustConnection = request.server ? request : undefined;
+          // 用户信任新指纹后再次读取 Daemon 身份。
+          options.discoverDaemon = request.server !== undefined;
           this.hostKeyReview = {
             host: options.host, port: options.port, observed: failure.fingerprint, previous: options.fingerprint,
             reconnect: request.server !== undefined
@@ -595,6 +647,28 @@ struct Index {
           this.failOpening(failure.message || 'SSH 连接失败。');
         }
       }
+    }
+  }
+
+  private async rememberDaemonHost(server: SavedSshServer, connection: SshHandle): Promise<void> {
+    this.managingServers = true;
+    try {
+      const daemonHostId = hostIdFromDaemonHealth(daemonHealth(connection));
+      if (!daemonHostId || daemonHostId === server.daemonHostId) {
+        return;
+      }
+      if (await this.savedServerStore().bindDaemonHost(server, daemonHostId)) {
+        const updated: SavedSshServer = {
+          id: server.id, host: server.host, port: server.port, username: server.username,
+          zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId
+        };
+        this.savedServers = this.savedServers.map((item: SavedSshServer): SavedSshServer =>
+          item.id === updated.id ? updated : item);
+      }
+    } catch (_) {
+      // 本地存储暂不可写时保留已打开的终端，后续连接可重新确认绑定。
+    } finally {
+      this.managingServers = false;
     }
   }
 
@@ -716,10 +790,15 @@ struct Index {
         return;
       }
       if (bytes.byteLength === 0) {
+        const sessionClosed = this.openedPushLink && exitStatus(connection) === SESSION_UNAVAILABLE_EXIT_STATUS;
+        if (this.openedPushLink && !sessionClosed && !this.receivedTerminalOutput) {
+          this.errorText = '未能打开通知对应的会话，请确认会话仍在运行。';
+        }
         this.stopConnection();
-        this.statusText = '远端已断开';
+        this.statusText = sessionClosed ? 'Zellij 会话已关闭或改名' : '远端已断开';
         return;
       }
+      this.receivedTerminalOutput = true;
       this.renderPending = true;
       const encoded = this.base64.encodeToStringSync(new Uint8Array(bytes));
       this.runTerminalScript('window.nerveTerminal.write(' + JSON.stringify(encoded) + ')');
@@ -823,11 +902,11 @@ struct Index {
       Button('编辑', { type: ButtonType.Normal })
         .height(40).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
         .fontColor(FOREGROUND).backgroundColor(BACKGROUND)
-        .onClick(() => this.setServerEditor(true, server))
+        .onClick(() => this.useSavedServer(server.id, true))
       Button('连接', { type: ButtonType.Normal })
         .height(40).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
         .fontColor(BACKGROUND).backgroundColor(ACCENT)
-        .onClick(() => this.startConnection(server))
+        .onClick(() => this.useSavedServer(server.id, false))
     }.width('100%').padding(12).borderRadius(10).backgroundColor(SURFACE)
   }
 
@@ -898,13 +977,42 @@ struct Index {
           .fontColor(ERROR).backgroundColor(SURFACE)
           .onClick(() => this.removeServer())
       } else {
-        Button(this.checkingHostKey ? '正在核对主机' : this.pushLink ? '连接并打开会话' : '连接',
+        Button(this.checkingHostKey ? '正在核对主机' :
+          this.pushLink && !this.notificationServer ? '连接并打开会话' : '连接',
           { type: ButtonType.Normal })
           .layoutWeight(1).height(48).borderRadius(10).fontFamily(APP_FONT).fontSize(16)
           .fontWeight(FontWeight.Medium).fontColor(BACKGROUND).backgroundColor(ACCENT)
-          .onClick(() => this.startConnection())
+          .onClick(() => this.startConnection(undefined, this.notificationServer ? '' : this.pushLink))
       }
     }.width('100%')
+  }
+
+  @Builder
+  notificationCard() {
+    Column({ space: 10 }) {
+      Row({ space: 10 }) {
+        Column({ space: 4 }) {
+          Text('通知关联会话').fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
+          if (this.notificationServer) {
+            Text(this.notificationServer.username + '@' +
+              this.knownHostId(this.notificationServer.host, this.notificationServer.port))
+              .fontFamily(APP_FONT).fontSize(13).fontColor(MUTED).wordBreak(WordBreak.BREAK_ALL)
+          } else {
+            Text('选择发送通知的开发机').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
+          }
+        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+        Button('取消', { type: ButtonType.Normal })
+          .fontFamily(APP_FONT).fontSize(13).fontColor(FOREGROUND).backgroundColor(BACKGROUND)
+          .borderRadius(8).height(34)
+          .onClick(() => { AppStorage.set<string>('nervePushLink', ''); })
+      }.width('100%')
+      if (this.notificationServer) {
+        Button('打开会话', { type: ButtonType.Normal })
+          .width('100%').height(44).borderRadius(8).fontFamily(APP_FONT).fontSize(15)
+          .fontColor(BACKGROUND).backgroundColor(ACCENT)
+          .onClick(() => this.openMatchedNotification())
+      }
+    }.width('100%').padding(12).borderRadius(10).backgroundColor(SURFACE)
   }
 
   @Builder
@@ -938,17 +1046,7 @@ struct Index {
             })
         }.width('100%').margin({ bottom: 8 })
         if (this.pushLink) {
-          Row({ space: 10 }) {
-            Column({ space: 4 }) {
-              Text('通知关联会话').fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
-              Text('连接触发通知的开发机 · ' + this.pushLink.slice(0, 8))
-                .fontFamily(APP_FONT).fontSize(12).fontColor(MUTED)
-            }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-            Button('取消', { type: ButtonType.Normal })
-              .fontFamily(APP_FONT).fontSize(13).fontColor(FOREGROUND).backgroundColor(BACKGROUND)
-              .borderRadius(8).height(34)
-              .onClick(() => { AppStorage.set<string>('nervePushLink', ''); })
-          }.width('100%').padding(12).borderRadius(10).backgroundColor(SURFACE)
+          this.notificationCard()
         }
         if (this.serverListUnavailable) {
           Row({ space: 8 }) {
@@ -1026,7 +1124,7 @@ struct Index {
   }
 
   @Builder
-  terminalView() {
+  terminalView(instance: number) {
     Column() {
       Row({ space: 10 }) {
         Column({ space: 4 }) {
@@ -1036,10 +1134,17 @@ struct Index {
           Text(this.statusText).fontFamily(APP_FONT).fontSize(12).fontColor(this.connected ? ACCENT : MUTED)
         }.layoutWeight(1).alignItems(HorizontalAlign.Start)
         if (this.pushLink && this.pushLink !== this.openedPushLink) {
-          Button('查看通知', { type: ButtonType.Normal })
+          Button(this.notificationServer ? '打开会话' : '查看通知', { type: ButtonType.Normal })
             .height(34).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
             .fontColor(BACKGROUND).backgroundColor(ACCENT)
-            .onClick(() => this.backToForm())
+            .enabled(!this.managingServers)
+            .onClick(() => {
+              if (this.notificationServer) {
+                this.openMatchedNotification();
+              } else {
+                this.backToForm();
+              }
+            })
         }
         Button(this.connected ? '断开' : '返回', { type: ButtonType.Normal })
           .height(34).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
@@ -1067,8 +1172,12 @@ struct Index {
           return event.data.isMainFrame() && url !== TERMINAL_URL && url !== TERMINAL_LOADED_URL &&
             url !== TERMINAL_FILE_URL;
         })
-        .onPageEnd(() => this.runTerminalScript('window.nerveTerminal.start()'))
-        .onRenderExited(() => this.onTerminalError())
+        .onPageEnd(() => {
+          if (this.generation === instance) this.runTerminalScript('window.nerveTerminal.start()');
+        })
+        .onRenderExited(() => {
+          if (this.generation === instance) this.onTerminalError();
+        })
       if (this.errorText) {
         Text(this.errorText).width('100%').fontFamily(APP_FONT).fontColor(ERROR).fontSize(13)
           .padding({ left: 12, right: 12, top: 6 })
@@ -1098,7 +1207,9 @@ struct Index {
   build() {
     Column() {
       if (this.terminalVisible) {
-        this.terminalView()
+        ForEach([this.terminalInstance], (instance: number) => {
+          this.terminalView(instance)
+        }, (instance: number): string => String(instance))
       } else if (this.hostKeyReview) {
         this.reviewHostKey(this.hostKeyReview)
       } else if (this.pushSettingsVisible) {

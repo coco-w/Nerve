@@ -4,7 +4,10 @@ import { codexEvents, fromCodexHook, isRecord, parseAgentEvent, uuidPattern } fr
 import { nerveHome, requestJson } from './local-http.js';
 import { notificationFromEvent } from './notification.js';
 import { pushTargetFromEnv } from './push-client.js';
-import { attachExistingSession, listPanes, listSessions } from './zellij.js';
+import { attachExistingSession, listPanes, listSessions, ZellijSessionUnavailable } from './zellij.js';
+
+// SSH 客户端用此退出状态显示通知会话已关闭，即使远端终端未收到错误正文。
+const SESSION_UNAVAILABLE_EXIT_STATUS = 20;
 
 function printJson(value: unknown) {
   process.stdout.write(JSON.stringify(value, null, 2) + '\n');
@@ -119,5 +122,5 @@ async function main([command, arg, limit]: string[]) {
 main(process.argv.slice(2)).catch(error => {
   const message = error instanceof Error ? error.message : String(error);
   console.error('[Nerve] ' + message);
-  process.exitCode = 1;
+  process.exitCode = error instanceof ZellijSessionUnavailable ? SESSION_UNAVAILABLE_EXIT_STATUS : 1;
 });

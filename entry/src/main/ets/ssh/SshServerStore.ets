@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { relationalStore } from '@kit.ArkData';
 
 const TABLE = 'ssh_servers';
-const SERVER_COLUMNS = ['id', 'host', 'port', 'username', 'zellij_session', 'use_private_key'];
+const SERVER_COLUMNS = ['id', 'host', 'port', 'username', 'zellij_session', 'use_private_key', 'daemon_host_id'];
 const CREDENTIAL_COLUMNS = ['password', 'private_key', 'passphrase'];
 // 由鸿蒙生成和保管加密数据库的密钥，数据库目录配置为不参与应用备份。
 const STORE_CONFIG: relationalStore.StoreConfig = {
@@ -22,6 +22,8 @@ export interface SshServerSettings {
 
 export interface SavedSshServer extends SshServerSettings {
   id: number;
+  // 已通过本服务器的 SSH 连接确认的 Daemon ID，空字符串表示尚未绑定通知。
+  daemonHostId: string;
 }
 
 export interface SshCredentials {
@@ -50,8 +52,20 @@ export class SshServerStore {
       password TEXT NOT NULL DEFAULT '',
       private_key TEXT NOT NULL DEFAULT '',
       passphrase TEXT NOT NULL DEFAULT '',
+      daemon_host_id TEXT NOT NULL DEFAULT '',
       UNIQUE(host, port, username)
     )`);
+    // 原地升级已有的加密库，保留服务器记录和 SSH 凭据。
+    const column = await db.querySql(`SELECT name FROM pragma_table_info('${TABLE}') WHERE name = 'daemon_host_id'`);
+    let hasBindingColumn = false;
+    try {
+      hasBindingColumn = column.goToFirstRow();
+    } finally {
+      column.close();
+    }
+    if (!hasBindingColumn) {
+      await db.executeSql(`ALTER TABLE ${TABLE} ADD COLUMN daemon_host_id TEXT NOT NULL DEFAULT ''`);
+    }
     return db;
   }
 
@@ -83,7 +97,8 @@ export class SshServerStore {
           port: rows.getLong(rows.getColumnIndex('port')),
           username: rows.getString(rows.getColumnIndex('username')),
           zellijSession: rows.getString(rows.getColumnIndex('zellij_session')),
-          usePrivateKey: rows.getLong(rows.getColumnIndex('use_private_key')) === 1
+          usePrivateKey: rows.getLong(rows.getColumnIndex('use_private_key')) === 1,
+          daemonHostId: rows.getString(rows.getColumnIndex('daemon_host_id'))
         });
       }
       return servers;
@@ -114,7 +129,8 @@ export class SshServerStore {
   }
 
   // 新增、更新各用一次数据库写入，服务器配置和凭据一起提交。
-  async save(server: SshServerSettings, credentials: SshCredentials | undefined, id?: number): Promise<SavedSshServer> {
+  async save(server: SshServerSettings, credentials: SshCredentials | undefined,
+    previous?: SavedSshServer): Promise<SavedSshServer> {
     const db = await this.open();
     const values: relationalStore.ValuesBucket = {
       host: server.host,
@@ -129,7 +145,8 @@ export class SshServerStore {
       values['passphrase'] = credentials.passphrase;
     }
     let savedId: number;
-    if (id === undefined) {
+    let daemonHostId = '';
+    if (!previous) {
       if (!credentials) {
         throw new Error('新增服务器需要 SSH 凭据。');
       }
@@ -138,18 +155,30 @@ export class SshServerStore {
         throw new Error('服务器记录写入失败。');
       }
     } else {
+      // 更换 SSH 主机、端口或账号后，下一次连接重新查找该登录目标的 Daemon。
+      if (previous.host === server.host && previous.port === server.port && previous.username === server.username) {
+        daemonHostId = previous.daemonHostId;
+      } else {
+        values['daemon_host_id'] = '';
+      }
       // 沿用凭据时限制在同一个登录目标，防止账号或主机变更时带入原凭据。
-      const match = credentials ? new relationalStore.RdbPredicates(TABLE).equalTo('id', id) :
-        this.matchingLogin(id, server);
+      const match = credentials ? this.matchingLogin(previous.id, previous) : this.matchingLogin(previous.id, server);
       if (await db.update(values, match) !== 1) {
         throw new Error('服务器配置已变化，请重新编辑。');
       }
-      savedId = id;
+      savedId = previous.id;
     }
     return {
       id: savedId, host: server.host, port: server.port, username: server.username,
-      zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey
+      zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId
     };
+  }
+
+  async bindDaemonHost(server: SavedSshServer, daemonHostId: string): Promise<boolean> {
+    const db = await this.open();
+    // 连接过程中若配置被移除或已变更登录目标，丢弃迟到的绑定结果。
+    const binding: relationalStore.ValuesBucket = { daemon_host_id: daemonHostId };
+    return await db.update(binding, this.matchingLogin(server.id, server)) === 1;
   }
 
   async remove(id: number): Promise<void> {

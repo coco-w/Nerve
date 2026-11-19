@@ -19,6 +19,8 @@ namespace {
 
 constexpr int CONNECT_TIMEOUT_MS = 8000;
 constexpr int SSH_REQUEST_TIMEOUT_MS = 8000;
+constexpr int DAEMON_HEALTH_TIMEOUT_MS = 3200;
+constexpr size_t MAX_DAEMON_HEALTH_BYTES = 1024;
 constexpr int MAX_PTY_DIMENSION = 500;
 
 bool IsAlphaNumeric(char ch)
@@ -135,6 +137,11 @@ std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
         throw HostKeyMismatch(observed);
     }
     connection->Authenticate(options);
+    if (options.discoverDaemon) {
+        // 从已验证并认证的 SSH 连接读取主机 ID，通知参数只用于选择会话。
+        connection->daemonHealth_ = connection->ReadDaemonHealth();
+        libssh2_session_set_timeout(connection->session_, SSH_REQUEST_TIMEOUT_MS);
+    }
     connection->OpenPty(options);
     libssh2_session_set_blocking(connection->session_, 0);
     return connection;
@@ -195,6 +202,46 @@ void SshSession::Authenticate(const ConnectOptions &options) const
     if (result != 0) {
         throw std::runtime_error("SSH 身份验证失败，请检查用户名、凭据和服务端认证方式。");
     }
+}
+
+std::string SshSession::ReadDaemonHealth() const
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(DAEMON_HEALTH_TIMEOUT_MS);
+    const auto updateTimeout = [&]() {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) {
+            return false;
+        }
+        libssh2_session_set_timeout(session_, static_cast<long>(remaining));
+        return true;
+    };
+    if (!updateTimeout()) {
+        return {};
+    }
+    const auto release = [&](LIBSSH2_CHANNEL *channel) {
+        // 探测失败时仍可继续打开终端，临时通道的清理只短暂等待。
+        libssh2_session_set_timeout(session_, 100);
+        libssh2_channel_free(channel);
+    };
+    std::unique_ptr<LIBSSH2_CHANNEL, decltype(release)> channel(libssh2_channel_open_session(session_), release);
+    constexpr const char *command = "/bin/sh -c 'command -v nerve >/dev/null 2>&1 && exec nerve health'";
+    if (!channel || !updateTimeout() || libssh2_channel_exec(channel.get(), command) != 0) {
+        return {};
+    }
+
+    // 健康检查的 JSON 只交给应用解析，标准错误和过长输出不进入终端或绑定记录。
+    std::array<char, MAX_DAEMON_HEALTH_BYTES + 1> bytes {};
+    size_t length = 0;
+    while (length < bytes.size() && updateTimeout()) {
+        const ssize_t count = libssh2_channel_read(channel.get(), bytes.data() + length, bytes.size() - length);
+        if (count <= 0) {
+            return count == 0 && libssh2_channel_eof(channel.get()) &&
+                libssh2_channel_get_exit_status(channel.get()) == 0 ? std::string(bytes.data(), length) : std::string();
+        }
+        length += static_cast<size_t>(count);
+    }
+    return {};
 }
 
 void SshSession::OpenPty(const ConnectOptions &options)
@@ -258,6 +305,12 @@ ssize_t SshSession::Read(uint8_t *buffer, size_t capacity)
         return libssh2_channel_eof(channel_) == 1 ? -1 : 0;
     }
     throw std::runtime_error("SSH 终端读取失败，连接可能已中断。");
+}
+
+int SshSession::ExitStatus() const
+{
+    RequireOpen();
+    return libssh2_channel_get_exit_status(channel_);
 }
 
 size_t SshSession::Write(const uint8_t *buffer, size_t length)

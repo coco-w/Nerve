@@ -15,6 +15,7 @@ export interface SshConnectOptions extends SshEndpoint {
   passphrase: string;
   zellijSession: string;
   pushLink: string;
+  discoverDaemon?: boolean;
   columns: number;
   rows: number;
 }
@@ -27,8 +28,12 @@ export interface SshError extends Error {
 // 仅握手取指纹，不发起用户认证。
 export const probeHostKey: (endpoint: SshEndpoint) => Promise<string>;
 export const connect: (options: SshConnectOptions) => Promise<SshHandle>;
+// 返回这条已验证的 SSH 连接上读到的健康检查结果。
+export const daemonHealth: (connection: SshHandle) => string;
 // undefined 表示暂时无数据，空缓冲区表示远端结束。
 export const read: (connection: SshHandle) => ArrayBuffer | undefined;
+// 在读到远端 EOF 后读取 SSH 命令退出状态。
+export const exitStatus: (connection: SshHandle) => number;
 export const write: (connection: SshHandle, bytes: ArrayBuffer, offset: number) => number;
 export const resize: (connection: SshHandle, columns: number, rows: number) => boolean;
 export const disconnect: (connection: SshHandle) => void;
