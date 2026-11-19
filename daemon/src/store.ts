@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLOutputValue, StatementSync } from 'node:sqlite';
 import type { AgentEvent } from './agent.js';
@@ -45,6 +45,15 @@ export class EventStore {
       this.db.close();
       throw error;
     }
+  }
+
+  p2pSecret(): string {
+    // 配对码只通过用户私有的 Unix Socket 读取。Daemon 重启后保留原来的配对。
+    this.db.prepare("INSERT INTO metadata VALUES ('p2p_secret', ?) ON CONFLICT DO NOTHING")
+      .run(randomBytes(32).toString('base64url'));
+    const row = this.db.prepare("SELECT value FROM metadata WHERE key = 'p2p_secret'").get();
+    if (typeof row?.value !== 'string') throw new Error('无法读取 P2P 配对凭据');
+    return row.value;
   }
 
   append(event: AgentEvent) {

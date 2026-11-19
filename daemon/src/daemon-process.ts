@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { isRecord } from './agent.js';
 import { nerveHome, requestJson } from './local-http.js';
 import { ensurePrivateDirectory } from './private-directory.js';
+import { p2pHostFromEnv } from './p2p/config.js';
 import { pushTargetFromEnv } from './push-client.js';
 
 const startupTimeoutMs = 8000;
@@ -48,6 +49,7 @@ export async function startBackgroundDaemon(args: string[]) {
   }
   // 启动前报告配置错误，避免只在后台日志中看到原因。
   pushTargetFromEnv(process.env);
+  p2pHostFromEnv(process.env);
   const logPath = join(directory, 'daemon.log');
   const child = spawnDaemon(args, logPath);
   try {

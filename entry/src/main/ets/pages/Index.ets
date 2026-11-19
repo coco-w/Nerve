@@ -3,10 +3,11 @@ import { preferences } from '@kit.ArkData';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
-import { connect, daemonHealth, disconnect, exitStatus, probeHostKey, read, rebindMosh, resize, sendMoshDatagram,
-  SshConnectOptions, SshError, SshHandle, takeMoshInfo, write } from 'libnerve_ssh.so';
+import { connect, daemonHealth, disconnect, exitStatus, PeerHandle, probeHostKey, read, rebindMosh, releasePeer, resize,
+  resumeP2pMosh, sendMoshDatagram, SshConnectOptions, SshError, SshHandle, takeMoshInfo, write } from 'libnerve_ssh.so';
 import { hostIdFromDaemonHealth } from '../push/PushLink';
 import { PushSettings } from '../push/PushSettings';
+import { dialP2p, P2pPairing, parseP2pPairing } from '../ssh/P2pClient';
 import { SavedSshServer, SshCredentials, SshServerSettings, SshServerStore } from '../ssh/SshServerStore';
 import { ACCENT, APP_FONT, BACKGROUND, ERROR, FOREGROUND, MUTED, SURFACE } from '../ui/Theme';
 
@@ -43,6 +44,7 @@ interface HostKeyReview {
 interface SshOpenRequest {
   options: SshConnectOptions;
   server?: SavedSshServer;
+  pairing?: P2pPairing;
 }
 
 interface NerveOptionButtonParams {
@@ -129,6 +131,7 @@ struct Index {
   @State private serverListUnavailable: boolean = false;
   @State private serverAlias: string = '';
   @State private host: string = '';
+  @State private p2pCode: string = '';
   @State private port: string = '22';
   @State private username: string = '';
   @State private zellijSession: string = '';
@@ -159,6 +162,8 @@ struct Index {
   // 连接代次会在退出时增加，丢弃此前未完成的握手和渲染回调。
   private generation: number = 0;
   private connection: SshHandle | undefined;
+  private p2pSession: P2pPairing | undefined;
+  private reconnectingP2p: boolean = false;
   private moshActive: boolean = false;
   private moshPort: number = 0;
   private moshWasm: Uint8Array | undefined;
@@ -306,7 +311,8 @@ struct Index {
     this.errorText = '';
     this.editingServer = server;
     this.serverAlias = server?.alias ?? '';
-    this.host = server?.host ?? '';
+    this.host = server?.p2pEndpoint ? '' : server?.host ?? '';
+    this.p2pCode = server?.p2pEndpoint ?? '';
     this.port = server ? String(server.port) : '22';
     this.username = server?.username ?? '';
     this.zellijSession = server?.zellijSession ?? '';
@@ -317,16 +323,23 @@ struct Index {
   }
 
   private formHost(): string {
+    const pairing = parseP2pPairing(this.p2pCode);
+    if (pairing) return pairing.hostId;
     const host = this.host.trim().replace(/^\[([^\]]+)\]$/, '$1');
     return host.includes(':') ? host : host.toLowerCase();
   }
 
   private formSettings(useSession: boolean): SshServerSettings | undefined {
+    const pairing = parseP2pPairing(this.p2pCode);
+    if (this.p2pCode.trim() && !pairing) {
+      this.errorText = '请粘贴 nerve pair 输出的 P2P 配对地址。';
+      return undefined;
+    }
     const host = this.formHost();
     const username = this.username.trim();
-    const port = Number(this.port);
+    const port = pairing ? 22 : Number(this.port);
     const zellijSession = useSession ? this.zellijSession.trim() : '';
-    if (!host || !username || !/^\d{1,5}$/.test(this.port) || port < 1 || port > 65535) {
+    if (!host || !username || (!pairing && !/^\d{1,5}$/.test(this.port)) || port < 1 || port > 65535) {
       this.errorText = '请填写主机地址、用户名和 1–65535 范围内的端口。';
       return undefined;
     }
@@ -339,7 +352,7 @@ struct Index {
       this.errorText = '会话名可使用字母、数字、下划线、点和连字符。留空后可在终端中手动附接。';
       return undefined;
     }
-    const udpPort = this.useMosh ? this.moshPortInput.trim() : '';
+    const udpPort = this.useMosh && !pairing ? this.moshPortInput.trim() : '';
     const moshPort = udpPort ? Number(udpPort) : 0;
     if (udpPort && (!/^\d{1,5}$/.test(udpPort) || moshPort < 1 || moshPort > 65535)) {
       this.errorText = 'Mosh UDP 端口应为 1–65535，留空使用开发机分配的端口。';
@@ -348,7 +361,8 @@ struct Index {
     // 只输入空白字符等同于留空，连接身份仍使用实际主机与账号。
     return {
       alias: this.serverAlias.trim(), host, port, username, zellijSession,
-      usePrivateKey: this.usePrivateKey, useMosh: this.useMosh, moshPort
+      usePrivateKey: this.usePrivateKey, useMosh: this.useMosh, moshPort,
+      p2pEndpoint: pairing ? pairing.url + '#' + pairing.hostId : ''
     };
   }
 
@@ -361,7 +375,8 @@ struct Index {
 
   private canKeepSavedCredentials(): boolean {
     const server = this.editingServer;
-    return server !== undefined && server.host === this.formHost() && server.port === Number(this.port) &&
+    const port = parseP2pPairing(this.p2pCode) ? 22 : Number(this.port);
+    return server !== undefined && server.host === this.formHost() && server.port === port &&
       server.username === this.username.trim() && server.usePrivateKey === this.usePrivateKey;
   }
 
@@ -376,6 +391,11 @@ struct Index {
       return;
     }
     const editing = this.editingServer;
+    const secret = parseP2pPairing(this.p2pCode)?.secret;
+    if (server.p2pEndpoint && server.p2pEndpoint !== editing?.p2pEndpoint && !secret) {
+      this.errorText = '请粘贴含有效凭据的完整 P2P 配对地址。';
+      return;
+    }
     const editingId = editing?.id;
     this.managingServers = true;
     this.errorText = '';
@@ -390,7 +410,7 @@ struct Index {
         this.errorText = '该服务器账号已保存，请在列表中编辑。';
         return;
       }
-      const saved = await storage.save(server, credentials, editing);
+      const saved = await storage.save(server, credentials, editing, secret || undefined);
       this.savedServers = editingId === undefined ? [saved, ...this.savedServers] :
         this.savedServers.map((item: SavedSshServer): SavedSshServer => item.id === saved.id ? saved : item);
       this.setServerEditor(false);
@@ -520,7 +540,18 @@ struct Index {
       // 已匹配的通知由 attach-event 再校验主机，普通连接和手动选择会刷新绑定。
       discoverDaemon: server !== undefined && (!pushLink || server.daemonHostId !== pushLink.slice(0, 36))
     };
-    this.prepareConnection({ options, server });
+    const pairing = parseP2pPairing(server ? server.p2pEndpoint : this.p2pCode);
+    this.prepareConnection({ options, server, pairing });
+  }
+
+  private async openPeer(request: SshOpenRequest, generation: number): Promise<PeerHandle | undefined> {
+    const pairing = request.pairing;
+    if (!pairing) return undefined;
+    if (!pairing.secret && request.server) {
+      pairing.secret = (await this.savedServerStore().credentials(request.server)).p2pSecret ?? '';
+    }
+    if (!pairing.secret) throw new Error('请补全 P2P 配对地址。');
+    return dialP2p(pairing, (): boolean => this.generation === generation);
   }
 
   private async prepareConnection(request: SshOpenRequest): Promise<void> {
@@ -542,7 +573,14 @@ struct Index {
         return;
       }
       // 首次握手只取指纹，确认前不向主机发送用户名或凭据。
-      const observed = await probeHostKey({ host, port });
+      const peer = await this.openPeer(request, generation);
+      let observed: string;
+      try {
+        if (this.generation !== generation) return;
+        observed = await probeHostKey({ host, port, peer });
+      } finally {
+        if (peer) releasePeer(peer);
+      }
       if (this.generation === generation) {
         this.pendingTrustConnection = request;
         this.hostKeyReview = { host, port, observed, previous: '', reconnect: true };
@@ -649,7 +687,10 @@ struct Index {
         key: (): string => current() ? this.takeMoshKey() : '',
         datagram: (encoded: string) => { if (current()) this.writeMoshPacket(encoded); },
         rebind: () => {
-          if (current() && this.moshActive && this.connection) rebindMosh(this.connection);
+          if (current() && this.moshActive && this.connection) {
+            if (this.p2pSession) this.rebindP2p(this.p2pSession, this.connection, generation);
+            else rebindMosh(this.connection);
+          }
         },
         state: (status: string) => { if (current()) this.onMoshState(status); }
       }
@@ -675,7 +716,13 @@ struct Index {
 
   private async openConnection(request: SshOpenRequest, generation: number): Promise<void> {
     const options = request.options;
+    let peer: PeerHandle | undefined;
     try {
+      if (request.pairing) {
+        this.statusText = '正在协商 P2P 直连';
+        peer = await this.openPeer(request, generation);
+        if (this.generation !== generation) return;
+      }
       this.statusText = options.useMosh ? '正在通过 SSH 启动 Mosh' : '正在连接 SSH';
       if (request.server) {
         const credentials = await this.savedServerStore().credentials(request.server);
@@ -688,12 +735,14 @@ struct Index {
       }
       let opening: Promise<SshHandle>;
       try {
+        options.peer = peer;
         opening = connect(options);
       } finally {
         // 原生模块同步复制参数，后台握手和换钥确认期间不再持有 ArkTS 凭据副本。
         options.password = '';
         options.privateKey = '';
         options.passphrase = '';
+        options.peer = undefined;
       }
       const connection = await opening;
       if (this.generation !== generation) {
@@ -701,12 +750,13 @@ struct Index {
         return;
       }
       this.connection = connection;
+      this.p2pSession = request.pairing;
       if (this.moshActive) {
         this.statusText = '正在连接 Mosh';
         this.runTerminalScript('window.nerveTerminal.startMosh(' + options.columns + ',' + options.rows + ')');
       } else {
         this.connected = true;
-        this.statusText = 'SSH 已连接';
+        this.statusText = request.pairing ? 'SSH 已连接 · P2P 直连' : 'SSH 已连接';
       }
       this.ioTimer = setInterval(() => this.pumpTerminal(), POLL_MS);
       if (request.server && options.discoverDaemon) {
@@ -729,6 +779,25 @@ struct Index {
           this.failOpening(failure.message || (options.useMosh ? 'Mosh 连接失败。' : 'SSH 连接失败。'));
         }
       }
+    } finally {
+      if (peer) releasePeer(peer);
+    }
+  }
+
+  private async rebindP2p(pairing: P2pPairing, connection: SshHandle, generation: number): Promise<void> {
+    if (this.reconnectingP2p || this.closingMosh) return;
+    this.reconnectingP2p = true;
+    let peer: PeerHandle | undefined;
+    const current = (): boolean => this.generation === generation && !this.closingMosh;
+    try {
+      // 只重新打洞并绑定原来的 UDP 端口。原生 Mosh 会话和 Web 终端引擎继续保留。
+      peer = await dialP2p(pairing, current);
+      if (current()) resumeP2pMosh(connection, peer);
+    } catch (_) {
+      if (current()) this.statusText = 'P2P 等待网络恢复';
+    } finally {
+      if (peer) releasePeer(peer);
+      if (this.generation === generation) this.reconnectingP2p = false;
     }
   }
 
@@ -743,7 +812,7 @@ struct Index {
         const updated: SavedSshServer = {
           id: server.id, alias: server.alias, host: server.host, port: server.port, username: server.username,
           zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId,
-          useMosh: server.useMosh, moshPort: server.moshPort
+          useMosh: server.useMosh, moshPort: server.moshPort, p2pEndpoint: server.p2pEndpoint
         };
         this.savedServers = this.savedServers.map((item: SavedSshServer): SavedSshServer =>
           item.id === updated.id ? updated : item);
@@ -804,9 +873,9 @@ struct Index {
     }
     if (status === 'online') {
       this.connected = true;
-      this.statusText = 'Mosh 已连接';
+      this.statusText = this.p2pSession ? 'Mosh 已连接 · P2P 直连' : 'Mosh 已连接';
     } else if (status === 'waiting') {
-      const port = ' · UDP ' + this.moshPort;
+      const port = this.p2pSession ? ' · P2P' : ' · UDP ' + this.moshPort;
       this.statusText = this.connected ? 'Mosh 等待网络恢复' + port : '等待 Mosh 响应' + port;
     } else if (status === 'ended') {
       this.stopConnection();
@@ -856,6 +925,8 @@ struct Index {
     this.moshCloseTimer = -1;
     this.afterMoshClose = undefined;
     this.moshActive = false;
+    this.p2pSession = undefined;
+    this.reconnectingP2p = false;
     this.moshPort = 0;
     this.moshWasm = undefined;
     this.moshPumpPending = false;
@@ -1168,17 +1239,23 @@ struct Index {
   serverFields() {
     this.field('名称（可选）', this.serverAlias, '例如 我的 WSL', InputType.Normal, 128,
       (value: string) => { this.serverAlias = value; })
-    this.field('主机地址', this.host, '例如 dev.example.local', InputType.Normal, 253,
-      (value: string) => { this.host = value; })
+    this.field('P2P 配对地址（可选）', this.p2pCode, '粘贴 nerve pair 的输出', InputType.Password, 512,
+      (value: string) => { this.p2pCode = value; })
+    if (!this.p2pCode.trim()) {
+      this.field('主机地址', this.host, '例如 dev.example.local', InputType.Normal, 253,
+        (value: string) => { this.host = value; })
+    }
     Row({ space: 10 }) {
       Column() {
         this.field('用户名', this.username, 'SSH 用户', InputType.Normal, 128,
           (value: string) => { this.username = value; })
       }.layoutWeight(2)
-      Column() {
-        this.field('SSH 端口', this.port, '22', InputType.Number, 5,
-          (value: string) => { this.port = value; })
-      }.layoutWeight(1)
+      if (!this.p2pCode.trim()) {
+        Column() {
+          this.field('SSH 端口', this.port, '22', InputType.Number, 5,
+            (value: string) => { this.port = value; })
+        }.layoutWeight(1)
+      }
     }.width('100%')
     this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
       (value: string) => { this.zellijSession = value; })
@@ -1186,7 +1263,7 @@ struct Index {
       this.optionButton({ label: 'SSH', selected: !this.useMosh, onSelect: () => { this.useMosh = false; } })
       this.optionButton({ label: 'Mosh', selected: this.useMosh, onSelect: () => { this.useMosh = true; } })
     }.width('100%')
-    if (this.useMosh) {
+    if (this.useMosh && !this.p2pCode.trim()) {
       this.field('Mosh UDP 端口', this.moshPortInput, '可选 · 自动分配', InputType.Number, 5,
         (value: string) => { this.moshPortInput = value; })
     }

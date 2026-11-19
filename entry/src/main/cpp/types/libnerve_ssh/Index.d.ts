@@ -1,9 +1,11 @@
 // 原生连接由句柄管理，ArkTS 不直接访问底层套接字。
 export type SshHandle = Object;
+export type PeerHandle = Object;
 
 export interface SshEndpoint {
   host: string;
   port: number;
+  peer?: PeerHandle;
 }
 
 export interface SshConnectOptions extends SshEndpoint {
@@ -39,6 +41,13 @@ export const connect: (options: SshConnectOptions) => Promise<SshHandle>;
 export const takeMoshInfo: (connection: SshHandle) => SshMoshInfo;
 export const sendMoshDatagram: (connection: SshHandle, datagram: ArrayBuffer) => void;
 export const rebindMosh: (connection: SshHandle) => void;
+// 只交换 P2P 信令。SSH 主机指纹和 Mosh 密钥仍通过原来的连接取得。
+export const createPeer: (stun: string) => PeerHandle;
+export const peerOffer: (peer: PeerHandle) => string;
+export const applyPeerAnswer: (peer: PeerHandle, sdp: string) => void;
+export const peerState: (peer: PeerHandle) => number;
+export const resumeP2pMosh: (connection: SshHandle, peer: PeerHandle) => void;
+export const releasePeer: (peer: PeerHandle) => void;
 // 返回这条已验证的 SSH 连接上读到的健康检查结果。
 export const daemonHealth: (connection: SshHandle) => string;
 // undefined 表示暂时无数据，空缓冲区表示远端结束。

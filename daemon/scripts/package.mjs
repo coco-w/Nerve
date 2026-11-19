@@ -39,8 +39,11 @@ try {
   const entry = join(staging, 'cli.mjs');
   const bundleOptions = { absWorkingDir: root, bundle: true, platform: 'node', format: 'esm', target: 'node24' };
 
-  // 合并本地模块，运行时只使用 Node 内置模块。Daemon 额外嵌入 OMP 扩展。
-  await build({ ...bundleOptions, entryPoints: [product.entry], outfile: entry });
+  // ws 的 CommonJS 模块依然要加载 Node 内置库。依赖本体随单文件程序打包。
+  await build({
+    ...bundleOptions, entryPoints: [product.entry], outfile: entry,
+    banner: { js: 'import { createRequire as nerveCreateRequire } from "node:module"; const require = nerveCreateRequire(import.meta.url);' },
+  });
   const assets = {};
   if (component === 'daemon') {
     const extension = join(staging, 'omp-extension.mjs');
@@ -66,6 +69,21 @@ try {
   await chmod(installer, 0o755);
   const nodeBinary = await realpath(process.execPath);
   await copyFile(join(dirname(nodeBinary), '..', 'LICENSE'), join(bundle, 'Node.js-LICENSE'));
+  // 随归档分发已打包依赖的许可证。werift 的 npm 归档缺少主许可证，使用匹配版本的上游文件。
+  const licenseDir = join(bundle, 'licenses');
+  await mkdir(licenseDir);
+  const dependencies = component === 'gateway' ? ['ws'] :
+    ['werift', 'mediabunny', 'buffer', 'base64-js', 'ieee754', 'multicast-dns', 'thunky', 'dns-packet',
+      '@leichtgewicht/ip-codec'];
+  for (const dependency of dependencies) {
+    const source = dependency === 'werift' ? join(root, 'licenses', 'werift-LICENSE') :
+      join(root, 'node_modules', dependency, 'LICENSE');
+    await copyFile(source, join(licenseDir, dependency.replace('/', '-') + '-LICENSE'));
+  }
+  if (component === 'daemon') {
+    const notice = 'THIRD_PARTY_LICENSES_LIBWEBRTC.txt';
+    await copyFile(join(root, 'node_modules', 'werift', notice), join(licenseDir, notice));
+  }
 
   execFileSync('tar', ['-czf', archive, '-C', staging, name], { stdio: 'inherit' });
   execFileSync(process.execPath, [join(root, 'scripts', product.check), archive], { stdio: 'inherit' });

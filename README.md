@@ -55,6 +55,8 @@ flowchart LR
 
 首次原生构建需获取固定版本的 libssh2 1.11.1 和 AWS-LC 5.15.0。CMake 会校验归档的 SHA-256。网络受限时，把原始归档按 `libssh2-1.11.1.tar.gz` 和 `aws-lc-5.15.0.tar.gz` 命名，将 `NERVE_SSH_ARCHIVE_DIR` 指向所在目录后启动构建。使用 Hvigor 常驻进程时，先重启当前项目的构建进程以读取新的环境变量。终端渲染资源随 HAP 打包，其中 xterm.js 为 6.0.0，FitAddon 为 0.11.0。
 
+P2P 需要固定到 v0.24.6 的 libdatachannel，构建时获取该版本和三个子模块。网络受限时，把已检出对应版本及 `deps/libjuice`、`deps/plog`、`deps/usrsctp` 的源码目录传给 `NERVE_P2P_SOURCE_DIR`。 [libdatachannel v0.24.6](https://github.com/paullouisageneau/libdatachannel/tree/v0.24.6)
+
 原生联调程序从 Linux 构建运行。请用独立的测试 SSH 账户或临时授权的测试密钥。给定会话名时，程序会在其当前窗格中输入测试命令，窗格需运行 Shell 且先显示过 `NERVE_ZELLIJ_READY`。
 
 ~~~bash
@@ -79,6 +81,16 @@ Mosh 的 UDP 由鸿蒙原生层收发，协议引擎复用 MIT 许可的 mosh-go
 bash entry/src/main/mosh/build.sh
 node entry/src/main/mosh/test/roaming.cjs
 ~~~
+
+### 通过 Gateway 协商 P2P 直连（试验）
+
+手机和开发机主动连接 Gateway，Gateway 交换 ICE 信令。直连成功后，SSH 字节流和 Mosh 数据报分别通过加密的 WebRTC DataChannel 传输。Daemon 把它们转给本机 SSH 与 Mosh 服务。开发机只需保持可出站联网。
+
+1. 在 Gateway 的环境中设置随机的 `NERVE_P2P_ENROLL_TOKEN`，可用 `openssl rand -hex 32` 生成。公网部署使用 TLS 反代，把 `/v1/p2p` 的 WebSocket 升级请求转发到同机 HTTP Gateway。用 `NERVE_P2P_STUN=stun:网关地址:3478` 指定可达的 STUN 服务，例如同机运行的 coturn。通知入口仍可使用原有 HTTP 配置。 [coturn STUN 配置](https://github.com/coturn/coturn/blob/master/examples/etc/turnserver.conf)
+2. 在开发机设置 `NERVE_P2P_URL=wss://网关域名/v1/p2p`，导入同一个 `NERVE_P2P_ENROLL_TOKEN`，再重启 Daemon。本地 SSH 端口默认是 22，可用 `NERVE_P2P_SSH_PORT` 指定。运行 `nerve pair`，把完整输出通过可信方式交给自己的手机。
+3. 在 Nerve 添加服务器，粘贴 P2P 配对地址，并填写开发机的 SSH 用户名及凭据。选择 Mosh 时，Daemon 将流量转给启动在本机默认 UDP 端口范围内的标准 `mosh-server`。连接状态会显示「P2P 直连」。
+
+可信局域网可用 `ws://` 联调。同机反代以外的明文信令需要在 Gateway 上显式启用 `NERVE_P2P_ALLOW_HTTP=1`。同网段联调可以留空 `NERVE_P2P_STUN`。本阶段 P2P 只提供直连，遇到 UDP 被拦截或 NAT 无法穿透时会显示协商失败。
 
 ## 在新电脑上安装 Daemon
 

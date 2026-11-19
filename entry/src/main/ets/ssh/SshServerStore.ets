@@ -3,8 +3,8 @@ import { relationalStore } from '@kit.ArkData';
 
 const TABLE = 'ssh_servers';
 const SERVER_COLUMNS = ['id', 'alias', 'host', 'port', 'username', 'zellij_session', 'use_private_key', 'daemon_host_id',
-  'use_mosh', 'mosh_port'];
-const CREDENTIAL_COLUMNS = ['password', 'private_key', 'passphrase'];
+  'use_mosh', 'mosh_port', 'p2p_endpoint'];
+const CREDENTIAL_COLUMNS = ['password', 'private_key', 'passphrase', 'p2p_secret'];
 // 由鸿蒙生成和保管加密数据库的密钥，数据库目录配置为不参与应用备份。
 const STORE_CONFIG: relationalStore.StoreConfig = {
   name: 'servers.db',
@@ -24,6 +24,8 @@ export interface SshServerSettings {
   useMosh: boolean;
   // 旧服务器默认使用 SSH，Mosh UDP 端口 0 表示由开发机分配。
   moshPort: number;
+  // 只含 Gateway 地址和主机 ID，配对凭据按需读取。
+  p2pEndpoint: string;
 }
 
 export interface SavedSshServer extends SshServerSettings {
@@ -36,6 +38,7 @@ export interface SshCredentials {
   password: string;
   privateKey: string;
   passphrase: string;
+  p2pSecret?: string;
 }
 
 export class SshServerStore {
@@ -62,6 +65,8 @@ export class SshServerStore {
       daemon_host_id TEXT NOT NULL DEFAULT '',
       use_mosh INTEGER NOT NULL DEFAULT 0,
       mosh_port INTEGER NOT NULL DEFAULT 0,
+      p2p_endpoint TEXT NOT NULL DEFAULT '',
+      p2p_secret TEXT NOT NULL DEFAULT '',
       UNIQUE(host, port, username)
     )`);
     // 原地升级已有的加密库，保留服务器记录和 SSH 凭据。
@@ -86,6 +91,12 @@ export class SshServerStore {
     if (!names.has('alias')) {
       // 老记录继承空别名，第一次打开新版即可继续按地址显示。
       await db.executeSql(`ALTER TABLE ${TABLE} ADD COLUMN alias TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!names.has('p2p_endpoint')) {
+      await db.executeSql(`ALTER TABLE ${TABLE} ADD COLUMN p2p_endpoint TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!names.has('p2p_secret')) {
+      await db.executeSql(`ALTER TABLE ${TABLE} ADD COLUMN p2p_secret TEXT NOT NULL DEFAULT ''`);
     }
     return db;
   }
@@ -122,7 +133,8 @@ export class SshServerStore {
           usePrivateKey: rows.getLong(rows.getColumnIndex('use_private_key')) === 1,
           daemonHostId: rows.getString(rows.getColumnIndex('daemon_host_id')),
           useMosh: rows.getLong(rows.getColumnIndex('use_mosh')) === 1,
-          moshPort: rows.getLong(rows.getColumnIndex('mosh_port'))
+          moshPort: rows.getLong(rows.getColumnIndex('mosh_port')),
+          p2pEndpoint: rows.getString(rows.getColumnIndex('p2p_endpoint'))
         });
       }
       return servers;
@@ -139,13 +151,15 @@ export class SshServerStore {
 
   async credentials(server: SavedSshServer): Promise<SshCredentials> {
     const db = await this.open();
-    const row = await db.query(this.matchingLogin(server.id, server), CREDENTIAL_COLUMNS);
+    const row = await db.query(this.matchingLogin(server.id, server).equalTo('p2p_endpoint', server.p2pEndpoint),
+      CREDENTIAL_COLUMNS);
     try {
       if (!row.goToFirstRow()) {
         throw new Error('服务器配置已变化，请从列表重新选择。');
       }
       return {
-        password: row.getString(0), privateKey: row.getString(1), passphrase: row.getString(2)
+        password: row.getString(0), privateKey: row.getString(1), passphrase: row.getString(2),
+        p2pSecret: row.getString(3)
       };
     } finally {
       row.close();
@@ -154,7 +168,7 @@ export class SshServerStore {
 
   // 新增、更新各用一次数据库写入，服务器配置和凭据一起提交。
   async save(server: SshServerSettings, credentials: SshCredentials | undefined,
-    previous?: SavedSshServer): Promise<SavedSshServer> {
+    previous?: SavedSshServer, pairingSecret?: string): Promise<SavedSshServer> {
     const db = await this.open();
     const values: relationalStore.ValuesBucket = {
       alias: server.alias,
@@ -164,8 +178,14 @@ export class SshServerStore {
       zellij_session: server.zellijSession,
       use_private_key: server.usePrivateKey ? 1 : 0,
       use_mosh: server.useMosh ? 1 : 0,
-      mosh_port: server.moshPort
+      mosh_port: server.moshPort,
+      p2p_endpoint: server.p2pEndpoint
     };
+    if (!server.p2pEndpoint || pairingSecret) {
+      values['p2p_secret'] = pairingSecret ?? '';
+    } else if (server.p2pEndpoint !== previous?.p2pEndpoint) {
+      throw new Error('请填写完整的 P2P 配对地址。');
+    }
     if (credentials) {
       values['password'] = credentials.password;
       values['private_key'] = credentials.privateKey;
@@ -190,7 +210,7 @@ export class SshServerStore {
       }
       // 沿用凭据时限制在同一个登录目标，防止账号或主机变更时带入原凭据。
       const match = credentials ? this.matchingLogin(previous.id, previous) : this.matchingLogin(previous.id, server);
-      if (await db.update(values, match) !== 1) {
+      if (await db.update(values, match.equalTo('p2p_endpoint', previous.p2pEndpoint)) !== 1) {
         throw new Error('服务器配置已变化，请重新编辑。');
       }
       savedId = previous.id;
@@ -198,7 +218,7 @@ export class SshServerStore {
     return {
       id: savedId, alias: server.alias, host: server.host, port: server.port, username: server.username,
       zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId,
-      useMosh: server.useMosh, moshPort: server.moshPort
+      useMosh: server.useMosh, moshPort: server.moshPort, p2pEndpoint: server.p2pEndpoint
     };
   }
 
@@ -206,7 +226,7 @@ export class SshServerStore {
     const db = await this.open();
     // 连接过程中若配置被移除或已变更登录目标，丢弃迟到的绑定结果。
     const binding: relationalStore.ValuesBucket = { daemon_host_id: daemonHostId };
-    return await db.update(binding, this.matchingLogin(server.id, server)) === 1;
+    return await db.update(binding, this.matchingLogin(server.id, server).equalTo('p2p_endpoint', server.p2pEndpoint)) === 1;
   }
 
   async remove(id: number): Promise<void> {

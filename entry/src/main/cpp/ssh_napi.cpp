@@ -31,10 +31,8 @@ std::array<napi_value, Count> Arguments(napi_env env, napi_callback_info info)
     return args;
 }
 
-std::string StringProperty(napi_env env, napi_value options, const char *name, size_t maxLength)
+std::string StringValue(napi_env env, napi_value value, size_t maxLength)
 {
-    napi_value value;
-    Check(napi_get_named_property(env, options, name, &value));
     size_t length = 0;
     Check(napi_get_value_string_utf8(env, value, nullptr, 0, &length));
     if (length > maxLength) {
@@ -43,6 +41,13 @@ std::string StringProperty(napi_env env, napi_value options, const char *name, s
     std::string text(length, '\0');
     Check(napi_get_value_string_utf8(env, value, text.data(), length + 1, &length));
     return text;
+}
+
+std::string StringProperty(napi_env env, napi_value options, const char *name, size_t maxLength)
+{
+    napi_value value;
+    Check(napi_get_named_property(env, options, name, &value));
+    return StringValue(env, value, maxLength);
 }
 
 int IntValue(napi_env env, napi_value value)
@@ -79,6 +84,26 @@ nerve::SshSession &Connection(napi_env env, napi_value value)
     return *static_cast<nerve::SshSession *>(handle);
 }
 
+using PeerHandle = std::shared_ptr<nerve::P2pTransport>;
+
+PeerHandle &Peer(napi_env env, napi_value value)
+{
+    void *handle = nullptr;
+    Check(napi_get_value_external(env, value, &handle));
+    auto &peer = *static_cast<PeerHandle *>(handle);
+    if (!peer) throw std::runtime_error("P2P 句柄已释放。");
+    return peer;
+}
+
+PeerHandle OptionalPeer(napi_env env, napi_value options)
+{
+    napi_value value;
+    napi_valuetype type;
+    Check(napi_get_named_property(env, options, "peer", &value));
+    Check(napi_typeof(env, value, &type));
+    return type == napi_undefined ? nullptr : Peer(env, value);
+}
+
 template <typename Callback>
 napi_value Call(napi_env env, Callback callback)
 {
@@ -108,7 +133,8 @@ void ExecuteSshRequest(napi_env, void *data)
     auto &request = *static_cast<SshRequest *>(data);
     try {
         if (request.probeOnly) {
-            request.observedFingerprint = nerve::SshSession::ProbeHostKey(request.options.host, request.options.port);
+            request.observedFingerprint = nerve::SshSession::ProbeHostKey(request.options.host, request.options.port,
+                request.options.peer);
         } else {
             request.connection = nerve::SshSession::Connect(request.options);
         }
@@ -184,6 +210,7 @@ napi_value ProbeHostKey(napi_env env, napi_callback_info info)
         request->probeOnly = true;
         request->options.host = StringProperty(env, endpoint, "host", 253);
         request->options.port = IntProperty(env, endpoint, "port");
+        request->options.peer = OptionalPeer(env, endpoint);
         return QueueSshRequest(env, std::move(request), "NerveSshProbeHostKey");
     });
 }
@@ -195,6 +222,7 @@ napi_value Connect(napi_env env, napi_callback_info info)
         const napi_value options = Arguments<1>(env, info)[0];
         request->options.host = StringProperty(env, options, "host", 253);
         request->options.port = IntProperty(env, options, "port");
+        request->options.peer = OptionalPeer(env, options);
         request->options.username = StringProperty(env, options, "username", 256);
         request->options.fingerprint = StringProperty(env, options, "fingerprint", 50);
         request->options.zellijSession = StringProperty(env, options, "zellijSession", 128);
@@ -212,6 +240,75 @@ napi_value Connect(napi_env env, napi_callback_info info)
         request->options.size = {IntProperty(env, options, "columns"), IntProperty(env, options, "rows")};
 
         return QueueSshRequest(env, std::move(request), "NerveSshConnect");
+    });
+}
+
+void FinalizePeer(napi_env, void *data, void *)
+{
+    delete static_cast<PeerHandle *>(data);
+}
+
+napi_value CreatePeer(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        auto peer = std::make_unique<PeerHandle>(std::make_shared<nerve::P2pTransport>(
+            StringValue(env, Arguments<1>(env, info)[0], 320)));
+        napi_value result;
+        Check(napi_create_external(env, peer.get(), FinalizePeer, nullptr, &result));
+        peer.release();
+        return result;
+    });
+}
+
+napi_value PeerOffer(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        const auto offer = Peer(env, Arguments<1>(env, info)[0])->Offer();
+        napi_value result;
+        Check(napi_create_string_utf8(env, offer.data(), offer.size(), &result));
+        return result;
+    });
+}
+
+napi_value ApplyPeerAnswer(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        const auto args = Arguments<2>(env, info);
+        Peer(env, args[0])->SetAnswer(StringValue(env, args[1], 48 * 1024));
+        napi_value result;
+        Check(napi_get_undefined(env, &result));
+        return result;
+    });
+}
+
+napi_value PeerState(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        napi_value result;
+        Check(napi_create_int32(env, Peer(env, Arguments<1>(env, info)[0])->State(), &result));
+        return result;
+    });
+}
+
+napi_value ResumeP2pMosh(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        const auto args = Arguments<2>(env, info);
+        Connection(env, args[0]).ResumeMosh(Peer(env, args[1]));
+        napi_value result;
+        Check(napi_get_undefined(env, &result));
+        return result;
+    });
+}
+
+napi_value ReleasePeer(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        // SSH/Mosh 已接管的连接拥有自己的引用。
+        Peer(env, Arguments<1>(env, info)[0]).reset();
+        napi_value result;
+        Check(napi_get_undefined(env, &result));
+        return result;
     });
 }
 
@@ -355,6 +452,12 @@ napi_value Init(napi_env env, napi_value exports)
         {"takeMoshInfo", nullptr, TakeMoshInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendMoshDatagram", nullptr, SendMoshDatagram, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"rebindMosh", nullptr, RebindMosh, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"createPeer", nullptr, CreatePeer, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"peerOffer", nullptr, PeerOffer, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"applyPeerAnswer", nullptr, ApplyPeerAnswer, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"peerState", nullptr, PeerState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resumeP2pMosh", nullptr, ResumeP2pMosh, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"releasePeer", nullptr, ReleasePeer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"daemonHealth", nullptr, DaemonHealth, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"read", nullptr, Read, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exitStatus", nullptr, ExitStatus, nullptr, nullptr, nullptr, napi_default, nullptr},

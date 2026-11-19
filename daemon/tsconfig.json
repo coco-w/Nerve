@@ -5,6 +5,8 @@
     "rootDir": "src",
     "outDir": "dist",
     "strict": true,
+    // werift 的媒体声明与 TS 内置 WebCodecs 声明重叠，项目源码仍执行严格检查。
+    "skipLibCheck": true,
     "verbatimModuleSyntax": true,
     "noUncheckedIndexedAccess": true
   },

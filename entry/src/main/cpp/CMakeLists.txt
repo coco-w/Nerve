@@ -24,7 +24,7 @@ endif()
 # 随应用静态链接，避免依赖鸿蒙的私有 OpenSSL ABI。
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(BUILD_LIBSSL OFF CACHE BOOL "" FORCE)
+set(BUILD_LIBSSL ON CACHE BOOL "" FORCE)
 set(BUILD_TOOL OFF CACHE BOOL "" FORCE)
 set(DISABLE_GO ON CACHE BOOL "" FORCE)
 set(DISABLE_PERL ON CACHE BOOL "" FORCE)
@@ -43,10 +43,30 @@ FetchContent_Declare(libssh2
     URL_HASH SHA256=d9ec76cbe34db98eec3539fe2c899d26b0c837cb3eb466a56b0f109cabf658f7)
 FetchContent_MakeAvailable(libssh2)
 
-add_library(nerve_ssh_core STATIC ssh_session.cpp mosh_udp.cpp)
+# DataChannel 只传输终端数据，信令使用鸿蒙的 WebSocket。
+set(NO_MEDIA ON CACHE BOOL "" FORCE)
+set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+set(NO_TESTS ON CACHE BOOL "" FORCE)
+if(DEFINED ENV{NERVE_P2P_SOURCE_DIR})
+    file(TO_CMAKE_PATH "$ENV{NERVE_P2P_SOURCE_DIR}" FETCHCONTENT_SOURCE_DIR_LIBDATACHANNEL)
+endif()
+FetchContent_Declare(libdatachannel
+    GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
+    GIT_TAG 6b1e2e620f1e37f0eafeee702eaea0043cb305fd
+    GIT_SUBMODULES deps/libjuice deps/plog deps/usrsctp
+    GIT_SUBMODULES_RECURSE FALSE
+    GIT_CONFIG http.version=HTTP/1.1)
+FetchContent_MakeAvailable(libdatachannel)
+if(OHOS)
+    # usrsctp 的 POSIX 实现使用鸿蒙 libc 的 BSD 类型扩展。
+    target_compile_definitions(usrsctp PRIVATE _DEFAULT_SOURCE)
+endif()
+
+add_library(nerve_ssh_core STATIC ssh_session.cpp mosh_udp.cpp p2p_transport.cpp)
 target_compile_features(nerve_ssh_core PUBLIC cxx_std_17)
 target_include_directories(nerve_ssh_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(nerve_ssh_core PUBLIC libssh2::libssh2 PRIVATE OpenSSL::Crypto)
+target_link_libraries(nerve_ssh_core PUBLIC libssh2::libssh2 PRIVATE OpenSSL::Crypto datachannel)
 
 if(OHOS)
     add_library(nerve_ssh SHARED ssh_napi.cpp)

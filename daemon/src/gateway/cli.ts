@@ -15,7 +15,7 @@ async function main([command, ...args]: string[]) {
   // Gateway 有自己的监听端口和 SQLite 目录，可独立于 Daemon 部署。
   // 公网 HTTP 网关用 NERVE_GATEWAY_BIND=0.0.0.0，对通知入口强制使用签名。
   const { NERVE_GATEWAY_HOME, NERVE_GATEWAY_BIND = '127.0.0.1', NERVE_GATEWAY_PORT = '8787',
-    NERVE_GATEWAY_TOKEN = '' } = process.env;
+    NERVE_GATEWAY_TOKEN = '', NERVE_P2P_ENROLL_TOKEN, NERVE_P2P_STUN = '', NERVE_P2P_ALLOW_HTTP } = process.env;
   const port = Number(NERVE_GATEWAY_PORT);
   if (!/^\d+$/.test(NERVE_GATEWAY_PORT) || !Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error('NERVE_GATEWAY_PORT 应为 1–65535 的端口号');
@@ -28,8 +28,15 @@ async function main([command, ...args]: string[]) {
     token: NERVE_GATEWAY_TOKEN,
     bind: NERVE_GATEWAY_BIND,
     deliver: huawei ? deliverToHuawei(huawei) : undefined,
+    // 终端信令和推送复用监听端口，并使用各自的鉴权凭据。
+    signaling: NERVE_P2P_ENROLL_TOKEN ? {
+      enrollment: NERVE_P2P_ENROLL_TOKEN, stun: NERVE_P2P_STUN, allowHttp: NERVE_P2P_ALLOW_HTTP === '1',
+    } : undefined,
   });
-  const stop = () => server.close();
+  const stop = () => {
+    server.stopSignaling?.();
+    server.close();
+  };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   const mode = huawei ? 'Huawei Push Kit' : '本地收件';

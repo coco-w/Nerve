@@ -8,6 +8,8 @@ import { ensurePrivateDirectory } from '../private-directory.js';
 import { isGatewayToken } from '../push-client.js';
 import { PushQueue, startPushWorker } from '../push-queue.js';
 import type { PushDelivery } from '../push-queue.js';
+import { attachSignaling } from './signaling.js';
+import type { SignalingOptions } from './signaling.js';
 
 interface GatewayOptions {
   directory: string;
@@ -15,12 +17,13 @@ interface GatewayOptions {
   token: string;
   bind?: string;
   deliver?: PushDelivery;
+  signaling?: SignalingOptions;
 }
 
 const label = '[Nerve Push Gateway]';
 const bodyLimit = 4 * 1024;
 
-export async function startPushGateway({ directory, port, token, bind = '127.0.0.1', deliver }: GatewayOptions) {
+export async function startPushGateway({ directory, port, token, bind = '127.0.0.1', deliver, signaling }: GatewayOptions) {
   if (!isGatewayToken(token)) throw new Error('NERVE_GATEWAY_TOKEN 应为 32–256 个字符的随机密钥');
   if (bind !== '127.0.0.1' && bind !== '0.0.0.0') {
     throw new Error('NERVE_GATEWAY_BIND 应为 127.0.0.1 或 0.0.0.0');
@@ -65,14 +68,21 @@ export async function startPushGateway({ directory, port, token, bind = '127.0.0
       }
     });
 
-    server.listen(port, bind);
-    await once(server, 'listening');
+    const stopSignaling = signaling && attachSignaling(server, signaling);
+    try {
+      server.listen(port, bind);
+      await once(server, 'listening');
+    } catch (error) {
+      stopSignaling?.();
+      throw error;
+    }
     const stop = deliver && startPushWorker(queue, deliver, label);
     server.once('close', () => {
+      stopSignaling?.();
       stop?.();
       db.close();
     });
-    return server;
+    return Object.assign(server, { stopSignaling });
   } catch (error) {
     db.close();
     throw error;

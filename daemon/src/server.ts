@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { join } from 'node:path';
 import { parseAgentEvent, uuidPattern } from './agent.js';
 import { jsonServer, readJson, RequestError, sendJson } from './http-json.js';
+import type { P2pHostConfig } from './p2p/config.js';
 import { ensurePrivateDirectory } from './private-directory.js';
 import { deliverToGateway } from './push-client.js';
 import type { PushTarget } from './push-client.js';
@@ -20,12 +21,16 @@ function cursorParam(value: string | null, fallback: number, min: number, max: n
   return number;
 }
 
-async function route(request: IncomingMessage, response: ServerResponse, store: EventStore, stop: () => void) {
+async function route(request: IncomingMessage, response: ServerResponse, store: EventStore, stop: () => void,
+  pairing: string) {
   const url = new URL(request.url ?? '/', 'http://nerve.local');
   if (request.method === 'GET' && url.pathname === '/v1/health') {
     sendJson(response, 200, { status: 'ok', schemaVersion: 1, hostId: store.hostId });
   } else if (request.method === 'GET' && url.pathname === '/v1/push/status') {
     sendJson(response, 200, { enabled: store.pushEnabled, ...store.pushQueue.status() });
+  } else if (request.method === 'GET' && url.pathname === '/v1/p2p/pairing') {
+    if (!pairing) throw new RequestError(404, 'p2p_disabled');
+    sendJson(response, 200, { pairing });
   } else if (request.method === 'POST' && url.pathname === '/v1/shutdown') {
     await readJson(request, 64, 'shutdown_request_too_large');
     // 先停监听，再回复停止指令，便于客户端随后重新启动。
@@ -54,13 +59,17 @@ async function route(request: IncomingMessage, response: ServerResponse, store: 
   }
 }
 
-export async function startDaemon(directory: string, pushTarget?: PushTarget) {
+export async function startDaemon(directory: string, pushTarget?: PushTarget, p2p?: P2pHostConfig) {
   if (process.platform === 'win32') throw new Error('请在 WSL、Linux 或 macOS 中启动 Daemon');
+  const p2pModule = p2p && await import('./p2p/host.js');
   ensurePrivateDirectory(directory, 'NERVE_HOME');
   const socketPath = join(directory, 'nerve.sock');
   const store = new EventStore(join(directory, 'events.sqlite'), pushTarget !== undefined);
+  const p2pSecret = p2p ? store.p2pSecret() : '';
+  // URL 片段用于给 App 配对，连接信令服务时只用前面的 WebSocket 地址。
+  const pairing = p2p ? p2p.url + '#' + store.hostId + '.' + p2pSecret : '';
   // 停止命令走同一个用户私有 Socket，无需根据 PID 猜测要停止的进程。
-  const server = jsonServer('[Nerve]', (request, response) => route(request, response, store, stopListening));
+  const server = jsonServer('[Nerve]', (request, response) => route(request, response, store, stopListening, pairing));
   function stopListening() {
     server.close();
   }
@@ -72,7 +81,9 @@ export async function startDaemon(directory: string, pushTarget?: PushTarget) {
     throw error;
   }
   const stop = pushTarget && startPushWorker(store.pushQueue, deliverToGateway(pushTarget), '[Nerve]');
+  const stopP2p = p2p && p2pModule?.startP2pHost(p2p, store.hostId, p2pSecret);
   server.once('close', () => {
+    stopP2p?.();
     stop?.();
     store.close();
   });

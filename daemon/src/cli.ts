@@ -5,6 +5,7 @@ import { fromCodexHook, isRecord, parseAgentEvent, uuidPattern } from './agent.j
 import { daemonReadyMessage, startBackgroundDaemon, stopRunningDaemon } from './daemon-process.js';
 import { nerveHome, requestJson } from './local-http.js';
 import { notificationFromEvent } from './notification.js';
+import { p2pHostFromEnv } from './p2p/config.js';
 import { pushTargetFromEnv } from './push-client.js';
 import { codexHookGroups, setupAgents } from './setup-agents.js';
 import { attachExistingSession, listPanes, listSessions, ZellijSessionUnavailable } from './zellij.js';
@@ -82,7 +83,8 @@ async function main([command, arg, limit]: string[]) {
       }
       if (arg !== '--foreground' || limit !== undefined) throw new Error('用法为 nerve start [--foreground]');
       const { startDaemon } = await import('./server.js');
-      const { server, socketPath } = await startDaemon(nerveHome(), pushTargetFromEnv(process.env));
+      const { server, socketPath } = await startDaemon(nerveHome(), pushTargetFromEnv(process.env),
+        p2pHostFromEnv(process.env));
       const stop = () => server.close();
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
@@ -99,6 +101,19 @@ async function main([command, arg, limit]: string[]) {
     case 'health':
       printJson(await requestJson('/v1/health'));
       break;
+    case 'pair': {
+      if (arg !== undefined) throw new Error('用法为 nerve pair');
+      // 仅在显式执行配对命令时输出凭据，健康检查和后台日志不包含它。
+      const response = await requestJson('/v1/p2p/pairing').catch((error: unknown) => {
+        if (error instanceof Error && error.message === 'Daemon 返回 HTTP 404') {
+          throw new Error('此 Daemon 尚未启用 P2P，请配置 NERVE_P2P_URL 和 NERVE_P2P_ENROLL_TOKEN 后重启');
+        }
+        throw error;
+      });
+      if (!isRecord(response) || typeof response.pairing !== 'string') throw new Error('无法读取配对地址');
+      console.log(response.pairing);
+      break;
+    }
     case 'push-status':
       printJson(await requestJson('/v1/push/status'));
       break;
@@ -135,7 +150,7 @@ async function main([command, arg, limit]: string[]) {
       break;
     case undefined:
     case '--help':
-      console.log('nerve start [--foreground] | stop | health | push-status | events [after] [limit] | sessions | panes <session> | codex-config'
+      console.log('nerve start [--foreground] | stop | health | pair | push-status | events [after] [limit] | sessions | panes <session> | codex-config'
         + ' | attach-event <host-id> <event-id>' + (isSea() ? ' | setup-agents | omp-extension' : ''));
       break;
     default:

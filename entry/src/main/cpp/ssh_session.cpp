@@ -168,7 +168,7 @@ std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
     }
     ValidateSize(options.size);
 
-    auto connection = Handshake(options.host, options.port);
+    auto connection = Handshake(options.host, options.port, options.peer);
     // 首次信任后的新握手也必须校验指纹，且在发出任何认证请求之前比较。
     const std::string observed = connection->Fingerprint();
     if (observed != options.fingerprint) {
@@ -190,13 +190,14 @@ std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
     return connection;
 }
 
-std::string SshSession::ProbeHostKey(const std::string &host, int port)
+std::string SshSession::ProbeHostKey(const std::string &host, int port, const std::shared_ptr<P2pTransport> &peer)
 {
     // 首次连接只进行握手和取指纹，随后关闭临时连接。
-    return Handshake(host, port)->Fingerprint();
+    return Handshake(host, port, peer)->Fingerprint();
 }
 
-std::unique_ptr<SshSession> SshSession::Handshake(const std::string &host, int port)
+std::unique_ptr<SshSession> SshSession::Handshake(const std::string &host, int port,
+    const std::shared_ptr<P2pTransport> &peer)
 {
     if (host.empty() || host.find('\0') != std::string::npos || port < 1 || port > 65535) {
         throw std::runtime_error("请检查 SSH 主机地址和端口。");
@@ -206,7 +207,8 @@ std::unique_ptr<SshSession> SshSession::Handshake(const std::string &host, int p
         throw std::runtime_error("SSH 库初始化失败。");
     }
     auto connection = std::unique_ptr<SshSession>(new SshSession());
-    connection->socket_ = ConnectSocket(host, port);
+    connection->peer_ = peer;
+    connection->socket_ = peer ? peer->OpenSsh() : ConnectSocket(host, port);
     connection->session_ = libssh2_session_init();
     if (!connection->session_) {
         throw std::runtime_error("无法分配 SSH 会话。");
@@ -336,7 +338,11 @@ void SshSession::OpenMosh(const ConnectOptions &options)
         (options.moshPort > 0 && moshPort_ != options.moshPort)) {
         throw std::runtime_error("启动 mosh-server 失败，请检查 UDP 端口和开发机的 UTF-8 环境。");
     }
-    mosh_ = std::make_unique<MoshUdp>(socket_, moshPort_);
+    if (peer_) {
+        peer_->ForwardMosh(moshPort_);
+    } else {
+        mosh_ = std::make_unique<MoshUdp>(socket_, moshPort_);
+    }
 }
 
 void SshSession::ClearMoshKey()
@@ -348,6 +354,8 @@ void SshSession::SendMoshDatagram(const uint8_t *buffer, size_t length) const
 {
     if (mosh_) {
         mosh_->Send(buffer, length);
+    } else if (peer_ && moshPort_) {
+        peer_->SendMosh(buffer, length);
     }
 }
 
@@ -356,6 +364,14 @@ void SshSession::RebindMosh()
     if (mosh_) {
         mosh_->Rebind();
     }
+}
+
+void SshSession::ResumeMosh(const std::shared_ptr<P2pTransport> &peer)
+{
+    // 换网只替换数据通道，继续用同一个服务端端口和终端里的 Mosh 会话状态。
+    if (!peer_ || !peer || !moshPort_) throw std::runtime_error("当前会话不支持 P2P 续接。");
+    peer->ForwardMosh(moshPort_);
+    peer_ = peer;
 }
 
 void SshSession::OpenPty(const ConnectOptions &options)
@@ -399,6 +415,9 @@ ssize_t SshSession::Read(uint8_t *buffer, size_t capacity)
 {
     if (mosh_) {
         return mosh_->Read(buffer, std::min(capacity, MOSH_MAX_DATAGRAM));
+    }
+    if (peer_ && moshPort_) {
+        return peer_->ReadMosh(buffer, capacity);
     }
     RequireOpen();
     const ssize_t bytes = libssh2_channel_read(channel_, reinterpret_cast<char *>(buffer), capacity);
@@ -449,6 +468,7 @@ void SshSession::Close()
     ClearMoshKey();
     mosh_.reset();
     CloseSsh();
+    peer_.reset();
 }
 
 void SshSession::CloseSsh()

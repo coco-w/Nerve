@@ -11,6 +11,7 @@
 #include <libssh2.h>
 
 #include "mosh_udp.h"
+#include "p2p_transport.h"
 
 namespace nerve {
 
@@ -34,6 +35,7 @@ struct ConnectOptions {
     bool useMosh = false;
     // 0 由 mosh-server 在默认范围内分配，正数指定单个可达的 UDP 端口。
     int moshPort = 0;
+    std::shared_ptr<P2pTransport> peer;
 
     // 本地认证参数只用于建立连接，握手完成后清理原生侧副本。
     void ClearCredentials();
@@ -50,7 +52,8 @@ public:
 
 class SshSession final {
 public:
-    static std::string ProbeHostKey(const std::string &host, int port);
+    static std::string ProbeHostKey(const std::string &host, int port,
+        const std::shared_ptr<P2pTransport> &peer = {});
     static std::unique_ptr<SshSession> Connect(const ConnectOptions &options);
     ~SshSession();
 
@@ -65,6 +68,7 @@ public:
     void ClearMoshKey();
     void SendMoshDatagram(const uint8_t *buffer, size_t length) const;
     void RebindMosh();
+    void ResumeMosh(const std::shared_ptr<P2pTransport> &peer);
     int ExitStatus() const;
     size_t Write(const uint8_t *buffer, size_t length);
     bool Resize(PtySize size);
@@ -72,7 +76,8 @@ public:
 
 private:
     SshSession() = default;
-    static std::unique_ptr<SshSession> Handshake(const std::string &host, int port);
+    static std::unique_ptr<SshSession> Handshake(const std::string &host, int port,
+        const std::shared_ptr<P2pTransport> &peer);
     std::string Fingerprint() const;
     void Authenticate(const ConnectOptions &options) const;
     // 在已认证的 SSH 上读取短命令输出，返回退出码，-1 表示传输失败。
@@ -88,6 +93,7 @@ private:
     LIBSSH2_CHANNEL *channel_ = nullptr;
     std::string daemonHealth_;
     std::unique_ptr<MoshUdp> mosh_;
+    std::shared_ptr<P2pTransport> peer_;
     std::string moshKey_;
     int moshPort_ = 0;
 };
