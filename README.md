@@ -94,25 +94,30 @@ node entry/src/main/mosh/test/roaming.cjs
 
 ### 下载现成安装包
 
-在 Linux、WSL 或 macOS 的终端复制整段命令。它会识别系统和 x64／ARM64 架构，从 GitHub 下载对应安装包，校验 SHA-256 后安装。安装其他版本时修改第一行。Linux 包适用于使用 glibc 的发行版，例如 Ubuntu 和 Debian。 [GitHub Releases](https://github.com/coco-w/Nerve/releases)
+在 Linux、WSL 或 macOS 的终端复制整段命令。它会识别系统和 x64／ARM64 架构，从 GitHub 下载对应安装包，校验 SHA-256 后安装。第一行指定版本，第二行指定组件。安装 Daemon 用 `daemon`，安装 Push Gateway 用 `gateway`。Linux 包适用于使用 glibc 的发行版，例如 Ubuntu 和 Debian。 [GitHub Releases](https://github.com/coco-w/Nerve/releases)
 
 ~~~bash
 nerve_version=0.3.0
+nerve_component=daemon
 (
   set -eu
+  case "$nerve_component" in
+    daemon|gateway) ;;
+    *) printf '%s\n' '请选择 daemon 或 gateway。' >&2; exit 1 ;;
+  esac
   case "$(uname -s)" in
     Linux) nerve_os=linux ;;
     Darwin) nerve_os=macos ;;
-    *) printf '%s\n' '请在 Linux、WSL 或 macOS 中安装 Nerve Daemon。' >&2; exit 1 ;;
+    *) printf '%s\n' '请在 Linux、WSL 或 macOS 中安装。' >&2; exit 1 ;;
   esac
   case "$(uname -m)" in
     x86_64|amd64) nerve_arch=x64 ;;
     aarch64|arm64) nerve_arch=arm64 ;;
-    *) printf '%s\n' 'Nerve Daemon 提供 x64 和 ARM64 安装包。' >&2; exit 1 ;;
+    *) printf '%s\n' 'Nerve 提供 x64 和 ARM64 安装包。' >&2; exit 1 ;;
   esac
 
-  nerve_tag="daemon-v$nerve_version"
-  nerve_name="nerve-daemon-v$nerve_version-$nerve_os-$nerve_arch"
+  nerve_tag="$nerve_component-v$nerve_version"
+  nerve_name="nerve-$nerve_tag-$nerve_os-$nerve_arch"
   nerve_archive="$nerve_name.tar.gz"
   nerve_download="https://github.com/coco-w/Nerve/releases/download/$nerve_tag"
   nerve_tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/nerve-install.XXXXXXXX")
@@ -134,9 +139,9 @@ nerve_version=0.3.0
 )
 ~~~
 
-安装脚本默认把 `nerve` 放到 `~/.local/bin`。可以用 `NERVE_INSTALL_DIR` 指定命令目录。
+安装脚本默认把 `nerve` 或 `nerve-gateway` 放到 `~/.local/bin`。可以用 `NERVE_INSTALL_DIR` 指定命令目录。
 
-`./install.sh` 会探测 `PATH` 中的 `codex` 和 `omp`，合并 Codex Hook 并安装 OMP 扩展。之后才安装 Agent，或切换了 Agent 的配置目录时，可用 `"$HOME/.local/bin/nerve" setup-agents` 补配。重复运行沿用已有的相同配置。只安装 Daemon 可用 `./install.sh --no-agents`。
+Daemon 的 `./install.sh` 会探测 `PATH` 中的 `codex` 和 `omp`，合并 Codex Hook 并安装 OMP 扩展。之后才安装 Agent，或切换了 Agent 的配置目录时，可用 `"$HOME/.local/bin/nerve" setup-agents` 补配。重复运行沿用已有的相同配置。只安装 Daemon 可用 `./install.sh --no-agents`。
 
 ### 启动和停止
 
@@ -222,9 +227,19 @@ omp -e "/你的仓库路径/Nerve/daemon/adapters/omp/extension.ts"
 
 ## 推送通知
 
+### 安装 Push Gateway
+
+在运行网关的服务器上复制下载安装命令，将顶部的 `nerve_component` 改成 `gateway`。安装后的 `nerve-gateway` 内置运行时和 SQLite。设置共享令牌及需要的推送配置后启动。 [下载命令](#下载现成安装包)
+
+~~~bash
+"$HOME/.local/bin/nerve-gateway" start
+~~~
+
+Gateway 在前台运行，便于交由现有服务管理器管理。从源码版升级时，使用同一系统账号和原来的 `NERVE_GATEWAY_HOME`，沿用现有的通知队列与环境变量。源码版仍可在 `daemon/` 构建后用 `npm run gateway` 启动。
+
 ### 多台开发机共用一个 Gateway
 
-每台要发送 Codex 或 OMP 提醒的开发机运行 Nerve Daemon，统一把通知送到一台常开的 Push Gateway。Gateway 再调用 Huawei Push Kit 通知手机。`npm start` 启动 Daemon，`npm run gateway` 启动 Gateway。两个入口都位于 `daemon/`，可部署到不同机器。
+每台要发送 Codex 或 OMP 提醒的开发机运行 Nerve Daemon，统一把通知送到一台常开的 Push Gateway。Gateway 再调用 Huawei Push Kit 通知手机。
 
 | 运行位置 | 推送配置 |
 | --- | --- |
@@ -286,7 +301,7 @@ curl -fsS -H "Authorization: Bearer $NERVE_GATEWAY_TOKEN" http://127.0.0.1:8787/
 export NERVE_HUAWEI_SERVICE_ACCOUNT_FILE="$HOME/.nerve-gateway/huawei-service-account.json"
 export NERVE_HUAWEI_PUSH_TOKEN="$(cat "$HOME/.nerve-gateway/nerve-push-token.txt")"
 export NERVE_HUAWEI_TEST_MESSAGE=1
-npm run gateway
+"$HOME/.local/bin/nerve-gateway" start
 ~~~
 
 Gateway 开始投递其目录中待发送的通知。锁屏正文使用固定模板。点击通知只传入主机 ID 和事件 ID。 [华为通知字段](https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-scenariozed-api-request-param/)
@@ -299,17 +314,21 @@ Gateway 开始投递其目录中待发送的通知。锁屏正文使用固定模
 
 点击通知后，匹配到唯一的服务器时，点「打开会话」就会用保存的连接方式和凭据登录。尚无匹配或存在多个登录方式时，可手动选对应服务器，也可填写该主机的 SSH 凭据后点「连接并打开会话」。Nerve 校验 SSH 指纹和 Daemon 主机 ID，再按事件 ID 附接原来的 Zellij 会话。会话已关闭或改名时，终端会显示原因。
 
-## 发布 Daemon
+## 发布 Daemon 和 Gateway
 
-将 `daemon/package.json`、锁文件和安装命令顶部的版本更新后提交，例如在 `daemon/` 运行 `npm version 0.3.0 --no-git-tag-version`。推送与该版本一致的 `daemon-vX.Y.Z` 标签会自动运行测试、打包四个平台并发布带校验文件的 GitHub Release。以下命令以 0.3.0 为例。
+两个组件共用 `daemon/package.json` 的版本号，各用独立发布标签。推送 `daemon-vX.Y.Z` 发布 Daemon，推送 `gateway-vX.Y.Z` 发布 Push Gateway。工作流自动运行测试、打包四个平台并上传 SHA-256 校验文件。
+
+发布新版本前，在 `daemon/` 运行 `npm version <新版本号> --no-git-tag-version`，更新安装命令顶部的版本并提交。在仓库根目录运行以下命令可发布该版本的两个组件。
 
 ~~~bash
+nerve_version=$(node -p 'require("./daemon/package.json").version')
 git push origin main
-git tag -a daemon-v0.3.0 -m "🚀 发布 Nerve Daemon 0.3.0"
-git push origin daemon-v0.3.0
+git tag -a "daemon-v$nerve_version" -m "🚀 发布 Nerve Daemon $nerve_version"
+git tag -a "gateway-v$nerve_version" -m "🚀 发布 Nerve Gateway $nerve_version"
+git push origin "daemon-v$nerve_version" "gateway-v$nerve_version"
 ~~~
 
-可在 GitHub Actions 手动运行「Nerve Daemon 打包发布」取得测试安装包。开发者也可以用带许可证文件的 Node.js 26 官方发行包，在 `daemon/` 执行 `npm ci` 和 `npm run package`，产物位于 `daemon/release/`。macOS 安装包使用临时签名。 [发布工作流](.github/workflows/daemon-release.yml) · [Node.js 独立可执行文件](https://nodejs.org/api/single-executable-applications.html)
+在 GitHub Actions 手动运行发布工作流时，可选择组件构建测试安装包。本地打包需要带许可证文件的 Node.js 26 官方发行包。在 `daemon/` 运行 `npm ci`，然后运行 `npm run package` 打包 Daemon，或运行 `npm run package -- gateway` 打包 Gateway。产物位于 `daemon/release/`，macOS 安装包使用临时签名。 [发布工作流](.github/workflows/daemon-release.yml) · [Node.js 独立可执行文件](https://nodejs.org/api/single-executable-applications.html)
 
 ## 验收
 

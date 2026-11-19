@@ -1,16 +1,29 @@
-name: Nerve Daemon 打包发布
+name: Nerve Daemon 与 Gateway 打包发布
 
 on:
   push:
     tags:
       - 'daemon-v*'
+      - 'gateway-v*'
   workflow_dispatch:
+    inputs:
+      component:
+        description: 选择测试安装包
+        type: choice
+        default: daemon
+        options:
+          - daemon
+          - gateway
 
 permissions:
   contents: read
 
+# 正式发布按标签选择组件，手动运行时构建选定组件的测试包。
+env:
+  NERVE_COMPONENT: ${{ inputs.component || (startsWith(github.ref_name, 'gateway-v') && 'gateway' || 'daemon') }}
+
 concurrency:
-  group: daemon-release-${{ github.ref }}
+  group: nerve-release-${{ github.ref }}-${{ inputs.component }}
   cancel-in-progress: false
 
 jobs:
@@ -47,7 +60,7 @@ jobs:
         if: github.ref_type == 'tag'
         run: |
           version=$(node -p "require('./package.json').version")
-          if [[ "$GITHUB_REF_NAME" != "daemon-v$version" ]]; then
+          if [[ "$GITHUB_REF_NAME" != "$NERVE_COMPONENT-v$version" ]]; then
             echo "发布标签应与 daemon/package.json 的版本一致"
             exit 1
           fi
@@ -55,11 +68,11 @@ jobs:
         run: |
           npm ci
           npm test
-          npm run package
+          npm run package -- "$NERVE_COMPONENT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: nerve-daemon-${{ matrix.target }}
-          path: daemon/release/nerve-daemon-v*-${{ matrix.target }}.tar.gz
+          name: nerve-${{ env.NERVE_COMPONENT }}-${{ matrix.target }}
+          path: daemon/release/nerve-${{ env.NERVE_COMPONENT }}-v*-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           compression-level: 0
 
@@ -74,7 +87,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: nerve-daemon-*
+          pattern: nerve-${{ env.NERVE_COMPONENT }}-*
           path: release
           merge-multiple: true
       - name: 生成校验文件并发布
@@ -84,10 +97,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="$GITHUB_REF_NAME"
-          version="${tag#daemon-v}"
+          version="${tag#*-v}"
           packages=()
           for target in linux-x64 linux-arm64 macos-arm64 macos-x64; do
-            package="nerve-daemon-v$version-$target.tar.gz"
+            package="nerve-$tag-$target.tar.gz"
             test -s "$package"
             packages+=("$package")
           done
@@ -104,7 +117,7 @@ jobs:
           fi
           if [[ "$draft" != true ]]; then
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
-              --title "Nerve Daemon v$version" --generate-notes
+              --title "Nerve ${NERVE_COMPONENT^} v$version" --generate-notes
           fi
           gh release upload "$tag" "${packages[@]}" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
           gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false

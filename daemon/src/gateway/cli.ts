@@ -3,7 +3,15 @@ import { join, resolve } from 'node:path';
 import { deliverToHuawei, huaweiConfigFromEnv } from './huawei.js';
 import { startPushGateway } from './server.js';
 
-async function main() {
+async function main([command, ...args]: string[]) {
+  // 源码版和独立程序共用同一入口，支持由现有服务管理器前台运行。
+  if (command === '--help') {
+    console.log('nerve-gateway [start] · 通过 NERVE_GATEWAY_* 和 NERVE_HUAWEI_* 配置');
+    return;
+  }
+  if ((command !== undefined && command !== 'start') || args.length > 0) {
+    throw new Error('用法为 nerve-gateway [start]');
+  }
   // Gateway 有自己的监听端口和 SQLite 目录，可独立于 Daemon 部署。
   // 公网 HTTP 网关用 NERVE_GATEWAY_BIND=0.0.0.0，对通知入口强制使用签名。
   const { NERVE_GATEWAY_HOME, NERVE_GATEWAY_BIND = '127.0.0.1', NERVE_GATEWAY_PORT = '8787',
@@ -28,7 +36,7 @@ async function main() {
   console.error('[Nerve Push Gateway] 正在监听 ' + NERVE_GATEWAY_BIND + ':' + port + ' · ' + mode);
 }
 
-main().catch(error => {
+main(process.argv.slice(2)).catch(error => {
   console.error('[Nerve Push Gateway] ' + (error instanceof Error ? error.message : String(error)));
   process.exitCode = 1;
 });
