@@ -1,3 +1,4 @@
 {
-  "allowToBackupRestore": true
+  "allowToBackupRestore": true,
+  "excludes": ["data/storage/el2/database/entry/rdb/nerve_ssh/"]
 }

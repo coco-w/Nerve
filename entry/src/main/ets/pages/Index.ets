@@ -6,6 +6,7 @@ import { util } from '@kit.ArkTS';
 import { connect, disconnect, probeHostKey, read, resize, SshConnectOptions, SshError, SshHandle, write }
   from 'libnerve_ssh.so';
 import { PushSettings } from '../push/PushSettings';
+import { SavedSshServer, SshCredentials, SshServerSettings, SshServerStore } from '../ssh/SshServerStore';
 import { ACCENT, APP_FONT, BACKGROUND, ERROR, FOREGROUND, MUTED, SURFACE } from '../ui/Theme';
 
 // ArkWeb 拦截时使用资源 URL，加载后可能显示为 RAWFILE 格式。
@@ -29,6 +30,12 @@ interface HostKeyReview {
   port: number;
   observed: string;
   previous: string;
+  reconnect: boolean;
+}
+
+interface SshOpenRequest {
+  options: SshConnectOptions;
+  server?: SavedSshServer;
 }
 
 // 渲染层只传终端输入、尺寸和渲染确认，连接信息及凭据由 ArkTS 持有。
@@ -69,6 +76,12 @@ struct Index {
   @StorageProp('nervePushLink') @Watch('onPushLinkChanged') private pushLink: string = '';
   @State private pushSettingsVisible: boolean = false;
   @State private openedPushLink: string = '';
+  @State private openedRemoteTitle: string = '';
+  @State private savedServers: SavedSshServer[] = [];
+  @State private editingServer: SavedSshServer | undefined = undefined;
+  @State private serverEditorOpen: boolean = false;
+  @State private managingServers: boolean = false;
+  @State private serverListUnavailable: boolean = false;
   @State private host: string = '';
   @State private port: string = '22';
   @State private username: string = '';
@@ -86,6 +99,7 @@ struct Index {
   @State private ctrlArmed: boolean = false;
 
   private privateKey: string = '';
+  private serverStore: SshServerStore | undefined;
   private formKeyboardMode: KeyboardAvoidMode = KeyboardAvoidMode.OFFSET;
   private view = new webview.WebviewController();
   private readonly encoder = new util.TextEncoder();
@@ -95,9 +109,9 @@ struct Index {
   // 连接代次会在退出时增加，丢弃此前未完成的握手和渲染回调。
   private generation: number = 0;
   private connection: SshHandle | undefined;
-  // 首次确认前暂存本次表单，取消后丢弃，凭据始终留在内存中。
-  private pendingTrustConnection: SshConnectOptions | undefined;
-  private pendingConnection: SshConnectOptions | undefined;
+  // 等待确认或终端准备时，已保存的服务器只携带配置，不提前读取凭据。
+  private pendingTrustConnection: SshOpenRequest | undefined;
+  private pendingConnection: SshOpenRequest | undefined;
   private loadTimer: number = -1;
   private ioTimer: number = -1;
   private inputQueue: Array<ArrayBuffer> = [];
@@ -114,6 +128,7 @@ struct Index {
       familyName: APP_FONT,
       familySrc: $rawfile('fonts/MapleMono-NF-CN-Regular.ttf')
     });
+    this.loadSavedServers();
   }
 
   onBackPress(): boolean {
@@ -130,11 +145,18 @@ struct Index {
       this.pushSettingsVisible = false;
       return true;
     }
-    if (!this.terminalVisible) {
-      return false;
+    if (this.terminalVisible) {
+      this.backToForm();
+      return true;
     }
-    this.backToForm();
-    return true;
+    if (this.managingServers) {
+      return true;
+    }
+    if (this.serverEditorOpen) {
+      this.setServerEditor(false);
+      return true;
+    }
+    return false;
   }
 
   private onPushLinkChanged(): void {
@@ -157,6 +179,146 @@ struct Index {
     this.privateKey = '';
     this.passphrase = '';
     this.keySelected = false;
+  }
+
+  private savedServerStore(): SshServerStore {
+    if (!this.serverStore) {
+      const context = this.getUIContext().getHostContext();
+      if (!context) {
+        throw new Error('无法访问已保存的服务器。');
+      }
+      this.serverStore = new SshServerStore(context);
+    }
+    return this.serverStore;
+  }
+
+  private async loadSavedServers(): Promise<void> {
+    this.managingServers = true;
+    try {
+      this.savedServers = await this.savedServerStore().list();
+      this.serverListUnavailable = false;
+    } catch (_) {
+      this.serverListUnavailable = true;
+    } finally {
+      this.managingServers = false;
+    }
+  }
+
+  private setServerEditor(isOpen: boolean, server?: SavedSshServer): void {
+    this.generation++;
+    this.clearCredentials();
+    this.errorText = '';
+    this.editingServer = server;
+    this.host = server?.host ?? '';
+    this.port = server ? String(server.port) : '22';
+    this.username = server?.username ?? '';
+    this.zellijSession = server?.zellijSession ?? '';
+    this.usePrivateKey = server?.usePrivateKey ?? false;
+    this.serverEditorOpen = isOpen;
+  }
+
+  private formHost(): string {
+    const host = this.host.trim().replace(/^\[([^\]]+)\]$/, '$1');
+    return host.includes(':') ? host : host.toLowerCase();
+  }
+
+  private formSettings(useSession: boolean): SshServerSettings | undefined {
+    const host = this.formHost();
+    const username = this.username.trim();
+    const port = Number(this.port);
+    const zellijSession = useSession ? this.zellijSession.trim() : '';
+    if (!host || !username || !/^\d{1,5}$/.test(this.port) || port < 1 || port > 65535) {
+      this.errorText = '请填写主机地址、用户名和 1–65535 范围内的端口。';
+      return undefined;
+    }
+    if (this.encoder.encodeInto(host).length > 253 || this.encoder.encodeInto(username).length > 256 ||
+      host.includes('\u0000') || username.includes('\u0000')) {
+      this.errorText = '主机地址或用户名不符合 SSH 连接要求。';
+      return undefined;
+    }
+    if (zellijSession && !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(zellijSession)) {
+      this.errorText = '会话名可使用字母、数字、下划线、点和连字符。留空后可在终端中手动附接。';
+      return undefined;
+    }
+    return { host, port, username, zellijSession, usePrivateKey: this.usePrivateKey };
+  }
+
+  private formCredentials(): SshCredentials | undefined {
+    if (this.usePrivateKey ? !this.keySelected : !this.password) {
+      return undefined;
+    }
+    return { password: this.password, privateKey: this.privateKey, passphrase: this.passphrase };
+  }
+
+  private canKeepSavedCredentials(): boolean {
+    const server = this.editingServer;
+    return server !== undefined && server.host === this.formHost() && server.port === Number(this.port) &&
+      server.username === this.username.trim() && server.usePrivateKey === this.usePrivateKey;
+  }
+
+  private async saveServer(): Promise<void> {
+    const server = this.formSettings(true);
+    if (!server || this.managingServers) {
+      return;
+    }
+    const credentials = this.formCredentials();
+    if (!credentials && !this.canKeepSavedCredentials()) {
+      this.errorText = server.usePrivateKey ? '请选择 SSH 私钥。' : '请输入 SSH 密码。';
+      return;
+    }
+    const editingId = this.editingServer?.id;
+    this.managingServers = true;
+    this.errorText = '';
+    try {
+      const storage = this.savedServerStore();
+      if (this.serverListUnavailable) {
+        this.savedServers = await storage.list();
+        this.serverListUnavailable = false;
+      }
+      if (this.savedServers.some((item: SavedSshServer): boolean => item.id !== editingId &&
+        item.host === server.host && item.port === server.port && item.username === server.username)) {
+        this.errorText = '该服务器账号已保存，请在列表中编辑。';
+        return;
+      }
+      const saved = await storage.save(server, credentials, editingId);
+      this.savedServers = editingId === undefined ? [saved, ...this.savedServers] :
+        this.savedServers.map((item: SavedSshServer): SavedSshServer => item.id === saved.id ? saved : item);
+      this.setServerEditor(false);
+    } catch (_) {
+      this.errorText = '无法保存服务器，请重试。';
+    } finally {
+      this.managingServers = false;
+    }
+  }
+
+  private async removeServer(): Promise<void> {
+    const server = this.editingServer;
+    if (!server || this.managingServers) {
+      return;
+    }
+    const generation = this.generation;
+    try {
+      const result = await this.getUIContext().getPromptAction().showDialog({
+        title: '删除服务器',
+        message: '将从此设备移除该服务器的配置和 SSH 凭据。',
+        buttons: [{ text: '取消', color: '#565d62' }, { text: '删除', color: '#b3261e' }]
+      });
+      if (result.index !== 1 || this.generation !== generation) {
+        return;
+      }
+    } catch (_) {
+      return;
+    }
+    this.managingServers = true;
+    try {
+      await this.savedServerStore().remove(server.id);
+      this.savedServers = this.savedServers.filter((item: SavedSshServer): boolean => item.id !== server.id);
+      this.setServerEditor(false);
+    } catch (_) {
+      this.errorText = '无法删除服务器，请重试。';
+    } finally {
+      this.managingServers = false;
+    }
   }
 
   private changeAuth(usePrivateKey: boolean): void {
@@ -226,33 +388,34 @@ struct Index {
     }
   }
 
-  private async startConnection(): Promise<void> {
-    if (this.terminalVisible || this.hostKeyReview || this.checkingHostKey) {
+  private startConnection(server?: SavedSshServer): void {
+    if (this.terminalVisible || this.hostKeyReview || this.checkingHostKey || this.managingServers) {
       return;
     }
-    const host = this.host.trim().replace(/^\[([^\]]+)\]$/, '$1');
-    const username = this.username.trim();
-    const port = Number(this.port);
     // 通知只引用本地事件，通过已校验指纹的 SSH 连接到对应开发机后才解析会话。
     const pushLink = this.pushLink;
-    const session = pushLink ? '' : this.zellijSession.trim();
-    if (!host || !username || !/^\d{1,5}$/.test(this.port) || port < 1 || port > 65535) {
-      this.errorText = '请填写主机地址、用户名和 1–65535 范围内的端口。';
+    const settings = server ?? this.formSettings(!pushLink);
+    if (!settings) {
       return;
     }
-    if (session && !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(session)) {
-      this.errorText = '会话名可使用字母、数字、下划线、点和连字符。留空后可在终端中手动附接。';
+    const credentials = server ? undefined : this.formCredentials();
+    if (!server && !credentials) {
+      this.errorText = settings.usePrivateKey ? '请选择 SSH 私钥。' : '请输入 SSH 密码。';
       return;
     }
-    if ((this.usePrivateKey && !this.keySelected) || (!this.usePrivateKey && !this.password)) {
-      this.errorText = this.usePrivateKey ? '请选择 SSH 私钥。' : '请输入 SSH 密码。';
-      return;
-    }
-
     const options: SshConnectOptions = {
-      host, port, username, fingerprint: '', password: this.password, privateKey: this.privateKey,
-      passphrase: this.passphrase, zellijSession: session, pushLink, columns: 80, rows: 24
+      host: settings.host, port: settings.port, username: settings.username, fingerprint: '',
+      password: credentials?.password ?? '', privateKey: credentials?.privateKey ?? '',
+      passphrase: credentials?.passphrase ?? '', zellijSession: pushLink ? '' : settings.zellijSession,
+      pushLink, columns: 80, rows: 24
     };
+    this.prepareConnection({ options, server });
+  }
+
+  private async prepareConnection(request: SshOpenRequest): Promise<void> {
+    const options = request.options;
+    const host = options.host;
+    const port = options.port;
     const generation = ++this.generation;
     this.checkingHostKey = true;
     this.errorText = '';
@@ -264,14 +427,14 @@ struct Index {
       }
       if (typeof saved === 'string' && saved) {
         options.fingerprint = saved;
-        this.beginConnection(options);
+        this.beginConnection(request);
         return;
       }
       // 首次握手只取指纹，确认前不向主机发送用户名或凭据。
       const observed = await probeHostKey({ host, port });
       if (this.generation === generation) {
-        this.pendingTrustConnection = options;
-        this.hostKeyReview = { host, port, observed, previous: '' };
+        this.pendingTrustConnection = request;
+        this.hostKeyReview = { host, port, observed, previous: '', reconnect: true };
       }
     } catch (error) {
       if (this.generation === generation) {
@@ -317,12 +480,12 @@ struct Index {
       if (this.generation !== generation) {
         return;
       }
-      const options = this.pendingTrustConnection;
+      const request = this.pendingTrustConnection;
       this.pendingTrustConnection = undefined;
       this.hostKeyReview = undefined;
-      if (options) {
-        options.fingerprint = review.observed;
-        this.beginConnection(options);
+      if (request) {
+        request.options.fingerprint = review.observed;
+        this.beginConnection(request);
       }
     } catch (_) {
       if (this.generation === generation) {
@@ -335,10 +498,11 @@ struct Index {
     }
   }
 
-  private beginConnection(options: SshConnectOptions): void {
+  private beginConnection(request: SshOpenRequest): void {
     this.checkingHostKey = false;
-    this.pendingConnection = options;
-    this.openedPushLink = options.pushLink;
+    this.pendingConnection = request;
+    this.openedPushLink = request.options.pushLink;
+    this.openedRemoteTitle = request.options.zellijSession || request.options.host;
     this.clearCredentials();
     this.errorText = '';
     const generation = ++this.generation;
@@ -373,26 +537,40 @@ struct Index {
       return;
     }
     this.latestSize = { columns: Math.min(columns, 500), rows: Math.min(rows, 500) };
-    const options = this.pendingConnection;
-    if (options) {
+    const request = this.pendingConnection;
+    if (request) {
       this.pendingConnection = undefined;
       clearTimeout(this.loadTimer);
       this.loadTimer = -1;
-      options.columns = this.latestSize.columns;
-      options.rows = this.latestSize.rows;
+      request.options.columns = this.latestSize.columns;
+      request.options.rows = this.latestSize.rows;
       this.sentSize = this.latestSize;
-      this.openConnection(options, this.generation);
+      this.openConnection(request, this.generation);
     }
   }
 
-  private async openConnection(options: SshConnectOptions, generation: number): Promise<void> {
+  private async openConnection(request: SshOpenRequest, generation: number): Promise<void> {
+    const options = request.options;
     try {
       this.statusText = '正在连接 SSH';
-      const opening = connect(options);
-      // 原生模块同步复制所需参数，后台握手期间不再持有表单副本。
-      options.password = '';
-      options.privateKey = '';
-      options.passphrase = '';
+      if (request.server) {
+        const credentials = await this.savedServerStore().credentials(request.server);
+        if (this.generation !== generation) {
+          return;
+        }
+        options.password = credentials.password;
+        options.privateKey = credentials.privateKey;
+        options.passphrase = credentials.passphrase;
+      }
+      let opening: Promise<SshHandle>;
+      try {
+        opening = connect(options);
+      } finally {
+        // 原生模块同步复制参数，后台握手和换钥确认期间不再持有 ArkTS 凭据副本。
+        options.password = '';
+        options.privateKey = '';
+        options.passphrase = '';
+      }
       const connection = await opening;
       if (this.generation !== generation) {
         disconnect(connection);
@@ -408,8 +586,10 @@ struct Index {
         if (failure.fingerprint) {
           // 原生层已在用户认证前断开，须明确确认新密钥才能再次登录。
           this.backToForm();
+          this.pendingTrustConnection = request.server ? request : undefined;
           this.hostKeyReview = {
-            host: options.host, port: options.port, observed: failure.fingerprint, previous: options.fingerprint
+            host: options.host, port: options.port, observed: failure.fingerprint, previous: options.fingerprint,
+            reconnect: request.server !== undefined
           };
         } else {
           this.failOpening(failure.message || 'SSH 连接失败。');
@@ -622,6 +802,112 @@ struct Index {
   }
 
   @Builder
+  connectionError() {
+    if (this.errorText) {
+      Text(this.errorText).fontFamily(APP_FONT).fontColor(ERROR).fontSize(14)
+        .width('100%').copyOption(CopyOptions.LocalDevice)
+    }
+  }
+
+  @Builder
+  savedServerRow(server: SavedSshServer) {
+    Row({ space: 8 }) {
+      Column({ space: 4 }) {
+        Text(this.knownHostId(server.host, server.port))
+          .fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(server.username + (server.zellijSession ? ' · ' + server.zellijSession : ''))
+          .fontFamily(APP_FONT).fontSize(12).fontColor(MUTED)
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+      Button('编辑', { type: ButtonType.Normal })
+        .height(40).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
+        .fontColor(FOREGROUND).backgroundColor(BACKGROUND)
+        .onClick(() => this.setServerEditor(true, server))
+      Button('连接', { type: ButtonType.Normal })
+        .height(40).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
+        .fontColor(BACKGROUND).backgroundColor(ACCENT)
+        .onClick(() => this.startConnection(server))
+    }.width('100%').padding(12).borderRadius(10).backgroundColor(SURFACE)
+  }
+
+  @Builder
+  savedServerList() {
+    Row({ space: 8 }) {
+      Text('已保存的服务器').layoutWeight(1).fontFamily(APP_FONT).fontSize(16).fontColor(FOREGROUND)
+      Button('添加服务器', { type: ButtonType.Normal })
+        .height(40).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
+        .fontColor(FOREGROUND).backgroundColor(SURFACE)
+        .onClick(() => this.setServerEditor(true))
+    }.width('100%')
+    this.connectionError()
+    if (this.checkingHostKey) {
+      Text('正在核对主机').fontFamily(APP_FONT).fontColor(MUTED).fontSize(14)
+    }
+    ForEach(this.savedServers, (server: SavedSshServer) => {
+      this.savedServerRow(server)
+    }, (server: SavedSshServer): string => String(server.id))
+  }
+
+  @Builder
+  serverFields() {
+    this.field('主机地址', this.host, '例如 dev.example.local', InputType.Normal, 253,
+      (value: string) => { this.host = value; })
+    Row({ space: 10 }) {
+      Column() {
+        this.field('用户名', this.username, 'SSH 用户', InputType.Normal, 128,
+          (value: string) => { this.username = value; })
+      }.layoutWeight(2)
+      Column() {
+        this.field('端口', this.port, '22', InputType.Number, 5,
+          (value: string) => { this.port = value; })
+      }.layoutWeight(1)
+    }.width('100%')
+    if (this.serverEditorOpen || !this.pushLink) {
+      this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
+        (value: string) => { this.zellijSession = value; })
+    }
+    Row({ space: 8 }) {
+      this.authButton('密码', false)
+      this.authButton('私钥', true)
+    }.width('100%')
+    if (this.usePrivateKey) {
+      Button(this.keySelected ? '已选私钥 · 更换' : this.canKeepSavedCredentials() ? '已保存私钥 · 更换' : '选择私钥文件',
+        { type: ButtonType.Normal })
+        .width('100%').height(44).borderRadius(10).fontFamily(APP_FONT)
+        .fontColor(FOREGROUND).backgroundColor(SURFACE)
+        .onClick(() => { this.selectKey(); })
+      if (this.keySelected || !this.canKeepSavedCredentials()) {
+        this.field('私钥口令', this.passphrase, '未加密时留空', InputType.Password, 1024,
+          (value: string) => { this.passphrase = value; })
+      }
+    } else {
+      this.field('SSH 密码', this.password, this.canKeepSavedCredentials() ? '留空保留已保存密码' : '输入密码',
+        InputType.Password, 1024, (value: string) => { this.password = value; })
+    }
+    this.connectionError()
+    Row({ space: 10 }) {
+      Button(this.editingServer ? '保存修改' : '保存服务器', { type: ButtonType.Normal })
+        .layoutWeight(1).height(48).borderRadius(10).fontFamily(APP_FONT).fontSize(16)
+        .fontColor(this.editingServer ? BACKGROUND : FOREGROUND)
+        .backgroundColor(this.editingServer ? ACCENT : SURFACE)
+        .onClick(() => this.saveServer())
+      if (this.editingServer) {
+        Button('删除服务器', { type: ButtonType.Normal })
+          .layoutWeight(1).height(48).borderRadius(10).fontFamily(APP_FONT).fontSize(16)
+          .fontColor(ERROR).backgroundColor(SURFACE)
+          .onClick(() => this.removeServer())
+      } else {
+        Button(this.checkingHostKey ? '正在核对主机' : this.pushLink ? '连接并打开会话' : '连接',
+          { type: ButtonType.Normal })
+          .layoutWeight(1).height(48).borderRadius(10).fontFamily(APP_FONT).fontSize(16)
+          .fontWeight(FontWeight.Medium).fontColor(BACKGROUND).backgroundColor(ACCENT)
+          .onClick(() => this.startConnection())
+      }
+    }.width('100%')
+  }
+
+  @Builder
   connectionForm() {
     Scroll() {
       Column({ space: 14 }) {
@@ -637,12 +923,19 @@ struct Index {
             .borderRadius(10)
           Column({ space: 2 }) {
             Text('Nerve').fontFamily(APP_FONT).fontSize(25).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
-            Text('SSH 连接').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
+            Text(this.serverEditorOpen ? this.editingServer ? '编辑服务器' : '添加服务器' : 'SSH 连接')
+              .fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
           }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-          Button('推送通知', { type: ButtonType.Normal })
+          Button(this.serverEditorOpen ? '返回' : '推送通知', { type: ButtonType.Normal })
             .fontFamily(APP_FONT).fontSize(13).fontColor(FOREGROUND).backgroundColor(SURFACE)
             .borderRadius(8).height(36)
-            .onClick(() => { this.pushSettingsVisible = true; })
+            .onClick(() => {
+              if (this.serverEditorOpen) {
+                this.setServerEditor(false);
+              } else {
+                this.pushSettingsVisible = true;
+              }
+            })
         }.width('100%').margin({ bottom: 8 })
         if (this.pushLink) {
           Row({ space: 10 }) {
@@ -657,62 +950,27 @@ struct Index {
               .onClick(() => { AppStorage.set<string>('nervePushLink', ''); })
           }.width('100%').padding(12).borderRadius(10).backgroundColor(SURFACE)
         }
-        this.field('主机地址', this.host, '例如 dev.example.local', InputType.Normal, 253,
-          (value: string) => { this.host = value; })
-        Row({ space: 10 }) {
-          Column() {
-            this.field('用户名', this.username, 'SSH 用户', InputType.Normal, 128,
-              (value: string) => { this.username = value; })
-          }.layoutWeight(2)
-          Column() {
-            this.field('端口', this.port, '22', InputType.Number, 5,
-              (value: string) => { this.port = value; })
-          }.layoutWeight(1)
-        }.width('100%')
-        if (!this.pushLink) {
-          this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
-            (value: string) => { this.zellijSession = value; })
+        if (this.serverListUnavailable) {
+          Row({ space: 8 }) {
+            Text('暂时无法读取已保存的服务器').layoutWeight(1)
+              .fontFamily(APP_FONT).fontColor(ERROR).fontSize(13)
+            Button('重试', { type: ButtonType.Normal })
+              .height(36).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
+              .fontColor(FOREGROUND).backgroundColor(SURFACE)
+              .onClick(() => this.loadSavedServers())
+          }.width('100%')
         }
-        Row({ space: 8 }) {
-          this.authButton('密码', false)
-          this.authButton('私钥', true)
-        }.width('100%')
-        if (this.usePrivateKey) {
-          Button(this.keySelected ? '已选私钥 · 更换' : '选择私钥文件', { type: ButtonType.Normal })
-            .width('100%')
-            .height(44)
-            .borderRadius(10)
-            .fontFamily(APP_FONT)
-            .fontColor(FOREGROUND)
-            .backgroundColor(SURFACE)
-            .onClick(() => { this.selectKey(); })
-          this.field('私钥口令', this.passphrase, '未加密时留空', InputType.Password, 1024,
-            (value: string) => { this.passphrase = value; })
+        if (this.savedServers.length && !this.serverEditorOpen) {
+          this.savedServerList()
         } else {
-          this.field('SSH 密码', this.password, '输入密码', InputType.Password, 1024,
-            (value: string) => { this.password = value; })
+          this.serverFields()
         }
-        if (this.errorText) {
-          Text(this.errorText).fontFamily(APP_FONT).fontColor(ERROR).fontSize(14)
-            .width('100%').copyOption(CopyOptions.LocalDevice)
-        }
-        Button(this.checkingHostKey ? '正在核对主机' : this.pushLink ? '连接并打开会话' : '连接',
-          { type: ButtonType.Normal })
-          .width('100%')
-          .height(48)
-          .borderRadius(10)
-          .fontFamily(APP_FONT)
-          .fontSize(16)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(BACKGROUND)
-          .backgroundColor(ACCENT)
-          .onClick(() => this.startConnection())
       }
       .padding({ left: 20, top: 18, right: 20, bottom: 28 })
       .alignItems(HorizontalAlign.Start)
       .constraintSize({ maxWidth: 540 })
       .width('100%')
-      .enabled(!this.checkingHostKey)
+      .enabled(!this.checkingHostKey && !this.managingServers)
     }
     .width('100%')
     .height('100%')
@@ -737,7 +995,8 @@ struct Index {
           .fontColor(review.previous ? ERROR : FOREGROUND)
         Text(this.knownHostId(review.host, review.port)).fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
           .wordBreak(WordBreak.BREAK_ALL)
-        Text(review.previous ? '连接已阻止。请在开发机或可信渠道核对新指纹。更新信任后，需要重新填写 SSH 凭据。' :
+        Text(review.previous ?
+          '连接已阻止。请在开发机或可信渠道核对新指纹。' + (review.reconnect ? '' : '更新信任后，需要重新填写 SSH 凭据。') :
           '请确认这是你的开发机。确认后，Nerve 会在此设备记住它的主机密钥。')
           .fontFamily(APP_FONT).fontSize(14).fontColor(MUTED)
         if (review.previous) {
@@ -752,7 +1011,8 @@ struct Index {
             .layoutWeight(1).height(44).borderRadius(10).fontFamily(APP_FONT).fontSize(15)
             .fontColor(FOREGROUND).backgroundColor(SURFACE)
             .onClick(() => this.cancelHostKeyReview())
-          Button(review.previous ? '更新信任' : '信任并连接', { type: ButtonType.Normal })
+          Button(review.previous ? review.reconnect ? '更新并连接' : '更新信任' : '信任并连接',
+            { type: ButtonType.Normal })
             .layoutWeight(1).height(44).borderRadius(10).fontFamily(APP_FONT).fontSize(15)
             .fontColor(BACKGROUND).backgroundColor(ACCENT)
             .onClick(() => this.confirmHostKey())
@@ -770,7 +1030,7 @@ struct Index {
     Column() {
       Row({ space: 10 }) {
         Column({ space: 4 }) {
-          Text(this.openedPushLink ? this.host.trim() : this.zellijSession.trim() || this.host.trim())
+          Text(this.openedRemoteTitle)
             .fontFamily(APP_FONT).fontSize(17).fontWeight(FontWeight.Medium).fontColor(FOREGROUND).maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           Text(this.statusText).fontFamily(APP_FONT).fontSize(12).fontColor(this.connected ? ACCENT : MUTED)
