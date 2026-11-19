@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { getAsset, isSea } from 'node:sea';
 import { fileURLToPath } from 'node:url';
-import { codexEvents, fromCodexHook, isRecord, parseAgentEvent, uuidPattern } from './agent.js';
+import { fromCodexHook, isRecord, parseAgentEvent, uuidPattern } from './agent.js';
 import { nerveHome, requestJson } from './local-http.js';
 import { notificationFromEvent } from './notification.js';
 import { pushTargetFromEnv } from './push-client.js';
+import { codexHookGroups, setupAgents } from './setup-agents.js';
 import { attachExistingSession, listPanes, listSessions, ZellijSessionUnavailable } from './zellij.js';
 
 // SSH 客户端用此退出状态显示通知会话已关闭，即使远端终端未收到错误正文。
@@ -18,15 +19,10 @@ function shellQuote(value: string) {
   return "'" + value.replaceAll("'", "'\\''") + "'";
 }
 
-function codexHookConfig() {
+function codexHookCommand() {
   // 独立版直接调用可执行文件，源码版使用 Node 和脚本的绝对路径。
   const launcher = isSea() ? [process.execPath] : [process.execPath, fileURLToPath(import.meta.url)];
-  const command = [...launcher, 'codex-hook'].map(shellQuote).join(' ');
-  return {
-    hooks: Object.fromEntries(Object.keys(codexEvents).map(event => [
-      event, [{ hooks: [{ type: 'command', command, timeout: 3 }] }],
-    ])),
-  };
+  return [...launcher, 'codex-hook'].map(shellQuote).join(' ');
 }
 
 async function codexHook() {
@@ -106,7 +102,7 @@ async function main([command, arg, limit]: string[]) {
       await attachEvent(arg, limit);
       break;
     case 'codex-config':
-      printJson(codexHookConfig());
+      printJson({ hooks: codexHookGroups(codexHookCommand()) });
       break;
     case 'codex-hook':
       await codexHook();
@@ -116,10 +112,15 @@ async function main([command, arg, limit]: string[]) {
       if (!isSea()) throw new Error('源码版扩展位于 daemon/adapters/omp/extension.ts');
       process.stdout.write(getAsset('omp-extension.mjs', 'utf8'));
       break;
+    case 'setup-agents':
+      if (!isSea()) throw new Error('请使用安装包运行 nerve setup-agents，源码版的接入方式见 README。');
+      if (arg) throw new Error('用法为 nerve setup-agents');
+      if (!setupAgents(codexHookCommand(), getAsset('omp-extension.mjs', 'utf8'))) process.exitCode = 1;
+      break;
     case undefined:
     case '--help':
       console.log('nerve start | health | push-status | events [after] [limit] | sessions | panes <session> | codex-config'
-        + ' | attach-event <host-id> <event-id>' + (isSea() ? ' | omp-extension' : ''));
+        + ' | attach-event <host-id> <event-id>' + (isSea() ? ' | setup-agents | omp-extension' : ''));
       break;
     default:
       throw new Error('未知命令，请运行 nerve --help');

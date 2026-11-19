@@ -88,7 +88,7 @@ node entry/src/main/mosh/test/roaming.cjs
 | --- | --- |
 | 安装并运行 Daemon | 安装包内置 Node.js 与 SQLite。源码安装需要 Node.js 24.14.0 或更高版本和 npm。 [Node.js 下载](https://nodejs.org/en/download) |
 | 保留和附接开发会话 | Zellij，当前联调版本为 0.46.0，确保登录账号可以执行 `zellij`。 [Zellij 安装说明](https://zellij.dev/documentation/installation) |
-| 采集开发事件 | 安装并配置实际使用的 Codex CLI 或 Oh My Pi，再启用下方对应的 Hook 或扩展。 |
+| 采集开发事件 | 安装实际使用的 Codex CLI 或 Oh My Pi。Daemon 安装脚本会自动配置当前账号下已安装的 Agent。 |
 | 手机连接 | 启用 SSH 服务，让手机能访问开发机的 SSH 端口。使用 Mosh 时再安装 `mosh-server` 并提供可达的 UDP 端口。 [SSH 连接](#手机连接-ssh) · [Mosh 连接](#手机连接-mosh) |
 | 手机收推送 | 使用已有 Push Gateway 时，在启动 Daemon 前设置 `NERVE_GATEWAY_URL` 和对应的 `NERVE_GATEWAY_TOKEN`。 [共用网关配置](#多台开发机共用一个-gateway) |
 
@@ -103,16 +103,20 @@ node entry/src/main/mosh/test/roaming.cjs
 | Mac · Apple 芯片 | `macos-arm64.tar.gz` |
 | Mac · Intel | `macos-x64.tar.gz` |
 
-以 Linux／WSL x64 的 0.1.0 版为例，解压后运行安装脚本。
+以 Linux／WSL x64 的 0.2.0 版为例，解压后运行安装脚本。
 
 ~~~bash
-tar -xzf nerve-daemon-v0.1.0-linux-x64.tar.gz
-cd nerve-daemon-v0.1.0-linux-x64
+tar -xzf nerve-daemon-v0.2.0-linux-x64.tar.gz
+cd nerve-daemon-v0.2.0-linux-x64
 ./install.sh
 "$HOME/.local/bin/nerve" start
 ~~~
 
-安装脚本默认把 `nerve` 放到 `~/.local/bin`。可以用 `NERVE_INSTALL_DIR` 指定已有的命令目录。另开终端运行 `"$HOME/.local/bin/nerve" health` 检查状态和主机 ID。
+安装脚本默认把 `nerve` 放到 `~/.local/bin`。可以用 `NERVE_INSTALL_DIR` 指定命令目录。另开终端运行 `"$HOME/.local/bin/nerve" health` 检查状态和主机 ID。
+
+`./install.sh` 会探测 `PATH` 中的 `codex` 和 `omp`，合并 Codex Hook 并安装 OMP 扩展。之后才安装 Agent，或切换了 Agent 的配置目录时，可用 `"$HOME/.local/bin/nerve" setup-agents` 补配。重复运行沿用已有的相同配置。只安装 Daemon 可用 `./install.sh --no-agents`。
+
+启动 Daemon 后，从需要关联的 Zellij 窗格重新打开 Agent。Codex 初次提示时在 `/hooks` 里信任 Nerve Hook，OMP 启动时自动加载。运行 `"$HOME/.local/bin/nerve" events` 可查询收到的事件。
 
 ### 从源码安装
 
@@ -142,11 +146,7 @@ node dist/cli.js events 0 10   # 从游标 0 读取前 10 条
 
 ### Codex
 
-使用安装包时，通过 `nerve` 生成 Hook 配置。
-
-~~~bash
-"$HOME/.local/bin/nerve" codex-config > /tmp/nerve-codex-hooks.json
-~~~
+安装脚本把 Nerve Hook 追加到 `$CODEX_HOME/hooks.json`（默认 `~/.codex/hooks.json`），保留已有 Hook 的分组和顺序。Codex 在 `/hooks` 中提供命令的信任确认。 [Codex Hooks 文档](https://developers.openai.com/codex/hooks)
 
 使用源码版时，在仓库的 `daemon/` 目录执行以下命令。
 
@@ -154,17 +154,11 @@ node dist/cli.js events 0 10   # 从游标 0 读取前 10 条
 node dist/cli.js codex-config > /tmp/nerve-codex-hooks.json
 ~~~
 
-将输出中的 Hook 按事件合并到 `$CODEX_HOME/hooks.json`（默认 `~/.codex/hooks.json`）或受信任项目的 `.codex/hooks.json`。保留现有配置，从 Zellij 窗格启动 Codex，再用 `/hooks` 查看并信任新增的命令。生成的命令使用绝对路径，移动安装目录后请重新生成。 [Codex Hooks 文档](https://developers.openai.com/codex/hooks)
+将输出中的 Hook 按事件合并到用户配置或受信任项目的 `.codex/hooks.json`。从 Zellij 窗格启动 Codex，再用 `/hooks` 查看并信任新增的命令。生成的命令使用绝对路径，移动程序后应更新旧命令的路径。
 
 ### OMP
 
-使用安装包时，可从 `nerve` 导出与当前版本对应的扩展。从希望关联的 Zellij 窗格启动 OMP。
-
-~~~bash
-mkdir -p "$HOME/.local/share/nerve"
-"$HOME/.local/bin/nerve" omp-extension > "$HOME/.local/share/nerve/omp-extension.mjs"
-omp -e "$HOME/.local/share/nerve/omp-extension.mjs"
-~~~
+安装脚本通过 `omp config path` 找到当前 OMP 配置目录，将扩展安装为 `extensions/nerve-daemon.js`。装好后直接运行 `omp`。旧启动命令里如果使用 `-e` 手动加载了 Nerve 扩展，可以移除这个参数。为命名 profile 补配时，在同一账号下运行 `OMP_PROFILE=你的配置名 "$HOME/.local/bin/nerve" setup-agents`。 [OMP 扩展加载文档](https://github.com/can1357/oh-my-pi/blob/v18.22.2/docs/extension-loading.md)
 
 使用源码版时，将扩展路径替换为本机的绝对路径。
 
@@ -274,12 +268,12 @@ Gateway 开始投递其目录中待发送的通知。锁屏正文使用固定模
 
 ## 发布 Daemon
 
-将 `daemon/package.json` 和锁文件的版本更新后提交，例如在 `daemon/` 运行 `npm version 0.1.1 --no-git-tag-version`。推送与该版本一致的 `daemon-vX.Y.Z` 标签会自动运行测试、打包四个平台并发布带校验文件的 GitHub Release。以下命令以首个版本 0.1.0 为例。
+将 `daemon/package.json` 和锁文件的版本更新后提交，例如在 `daemon/` 运行 `npm version 0.2.0 --no-git-tag-version`。推送与该版本一致的 `daemon-vX.Y.Z` 标签会自动运行测试、打包四个平台并发布带校验文件的 GitHub Release。以下命令以 0.2.0 为例。
 
 ~~~bash
 git push origin main
-git tag -a daemon-v0.1.0 -m "🚀 发布 Nerve Daemon 0.1.0"
-git push origin daemon-v0.1.0
+git tag -a daemon-v0.2.0 -m "🚀 发布 Nerve Daemon 0.2.0"
+git push origin daemon-v0.2.0
 ~~~
 
 可在 GitHub Actions 手动运行「Nerve Daemon 打包发布」取得测试安装包。开发者也可以用带许可证文件的 Node.js 26 官方发行包，在 `daemon/` 执行 `npm ci` 和 `npm run package`，产物位于 `daemon/release/`。macOS 安装包使用临时签名。 [发布工作流](.github/workflows/daemon-release.yml) · [Node.js 独立可执行文件](https://nodejs.org/api/single-executable-applications.html)
