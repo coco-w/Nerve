@@ -59,6 +59,19 @@ int IntProperty(napi_env env, napi_value options, const char *name)
     return IntValue(env, value);
 }
 
+bool OptionalBoolProperty(napi_env env, napi_value options, const char *name)
+{
+    bool supplied = false;
+    Check(napi_has_named_property(env, options, name, &supplied));
+    bool enabled = false;
+    if (supplied) {
+        napi_value value;
+        Check(napi_get_named_property(env, options, name, &value));
+        Check(napi_get_value_bool(env, value, &enabled));
+    }
+    return enabled;
+}
+
 nerve::SshSession &Connection(napi_env env, napi_value value)
 {
     void *handle = nullptr;
@@ -186,12 +199,12 @@ napi_value Connect(napi_env env, napi_callback_info info)
         request->options.fingerprint = StringProperty(env, options, "fingerprint", 50);
         request->options.zellijSession = StringProperty(env, options, "zellijSession", 128);
         request->options.pushLink = StringProperty(env, options, "pushLink", 73);
-        bool discoverProvided = false;
-        Check(napi_has_named_property(env, options, "discoverDaemon", &discoverProvided));
-        if (discoverProvided) {
-            napi_value discover;
-            Check(napi_get_named_property(env, options, "discoverDaemon", &discover));
-            Check(napi_get_value_bool(env, discover, &request->options.discoverDaemon));
+        request->options.discoverDaemon = OptionalBoolProperty(env, options, "discoverDaemon");
+        request->options.useMosh = OptionalBoolProperty(env, options, "useMosh");
+        bool moshPortProvided = false;
+        Check(napi_has_named_property(env, options, "moshPort", &moshPortProvided));
+        if (request->options.useMosh && moshPortProvided) {
+            request->options.moshPort = IntProperty(env, options, "moshPort");
         }
         request->options.password = StringProperty(env, options, "password", 4096);
         request->options.privateKey = StringProperty(env, options, "privateKey", 32768);
@@ -199,6 +212,55 @@ napi_value Connect(napi_env env, napi_callback_info info)
         request->options.size = {IntProperty(env, options, "columns"), IntProperty(env, options, "rows")};
 
         return QueueSshRequest(env, std::move(request), "NerveSshConnect");
+    });
+}
+
+napi_value TakeMoshInfo(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        auto &connection = Connection(env, Arguments<1>(env, info)[0]);
+        const auto &key = connection.MoshKey();
+        if (key.empty()) {
+            throw std::runtime_error("Mosh 会话密钥不可用。");
+        }
+        napi_value result;
+        napi_value port;
+        napi_value secret;
+        const napi_status status = napi_create_string_utf8(env, key.data(), key.size(), &secret);
+        // 仅在打开内置终端时交付一次，原生侧立即清除。
+        connection.ClearMoshKey();
+        Check(status);
+        Check(napi_create_object(env, &result));
+        Check(napi_create_int32(env, connection.MoshPort(), &port));
+        Check(napi_set_named_property(env, result, "key", secret));
+        Check(napi_set_named_property(env, result, "port", port));
+        return result;
+    });
+}
+
+napi_value SendMoshDatagram(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        const auto args = Arguments<2>(env, info);
+        void *bytes = nullptr;
+        size_t length = 0;
+        Check(napi_get_arraybuffer_info(env, args[1], &bytes, &length));
+        if (length >= 24 && length <= nerve::MOSH_MAX_DATAGRAM) {
+            Connection(env, args[0]).SendMoshDatagram(static_cast<const uint8_t *>(bytes), length);
+        }
+        napi_value result;
+        Check(napi_get_undefined(env, &result));
+        return result;
+    });
+}
+
+napi_value RebindMosh(napi_env env, napi_callback_info info)
+{
+    return Call(env, [&]() {
+        Connection(env, Arguments<1>(env, info)[0]).RebindMosh();
+        napi_value result;
+        Check(napi_get_undefined(env, &result));
+        return result;
     });
 }
 
@@ -290,6 +352,9 @@ napi_value Init(napi_env env, napi_value exports)
     const napi_property_descriptor properties[] = {
         {"probeHostKey", nullptr, ProbeHostKey, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"connect", nullptr, Connect, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"takeMoshInfo", nullptr, TakeMoshInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sendMoshDatagram", nullptr, SendMoshDatagram, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"rebindMosh", nullptr, RebindMosh, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"daemonHealth", nullptr, DaemonHealth, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"read", nullptr, Read, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exitStatus", nullptr, ExitStatus, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -16,8 +16,16 @@ export interface SshConnectOptions extends SshEndpoint {
   zellijSession: string;
   pushLink: string;
   discoverDaemon?: boolean;
+  useMosh?: boolean;
+  moshPort?: number;
   columns: number;
   rows: number;
+}
+
+// 只在启动 Mosh 协议引擎时取用一次，密钥仅在本次连接的内存中存在。
+export interface SshMoshInfo {
+  key: string;
+  port: number;
 }
 
 // 只有登录前的主机密钥不匹配错误附带实际指纹。
@@ -28,6 +36,9 @@ export interface SshError extends Error {
 // 仅握手取指纹，不发起用户认证。
 export const probeHostKey: (endpoint: SshEndpoint) => Promise<string>;
 export const connect: (options: SshConnectOptions) => Promise<SshHandle>;
+export const takeMoshInfo: (connection: SshHandle) => SshMoshInfo;
+export const sendMoshDatagram: (connection: SshHandle, datagram: ArrayBuffer) => void;
+export const rebindMosh: (connection: SshHandle) => void;
 // 返回这条已验证的 SSH 连接上读到的健康检查结果。
 export const daemonHealth: (connection: SshHandle) => string;
 // undefined 表示暂时无数据，空缓冲区表示远端结束。

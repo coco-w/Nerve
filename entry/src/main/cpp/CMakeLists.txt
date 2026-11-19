@@ -43,7 +43,7 @@ FetchContent_Declare(libssh2
     URL_HASH SHA256=d9ec76cbe34db98eec3539fe2c899d26b0c837cb3eb466a56b0f109cabf658f7)
 FetchContent_MakeAvailable(libssh2)
 
-add_library(nerve_ssh_core STATIC ssh_session.cpp)
+add_library(nerve_ssh_core STATIC ssh_session.cpp mosh_udp.cpp)
 target_compile_features(nerve_ssh_core PUBLIC cxx_std_17)
 target_include_directories(nerve_ssh_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(nerve_ssh_core PUBLIC libssh2::libssh2 PRIVATE OpenSSL::Crypto)

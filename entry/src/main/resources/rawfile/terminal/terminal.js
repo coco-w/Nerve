@@ -16,6 +16,7 @@ const container = document.getElementById('terminal');
 terminal.loadAddon(fit);
 
 let native = null;
+let mosh = null;
 let fitFrame = 0;
 const keys = { escape: '\x1b', tab: '\t', enter: '\r', up: 'A', down: 'B', right: 'C', left: 'D' };
 
@@ -58,6 +59,16 @@ window.nerveTerminal = {
     const bytes = Uint8Array.from(raw, ch => ch.charCodeAt(0));
     // 写入回调在 xterm 解析完成后释放背压，避免连续输出塞满浏览器队列。
     terminal.write(bytes, () => native.onOutputFlushed());
+  },
+  startMosh(columns, rows) {
+    mosh = new MoshTerminal(terminal, native);
+    mosh.start(columns, rows).catch(() => mosh.finish('error'));
+  },
+  pumpMosh(packets, input, columns, rows) {
+    return mosh ? mosh.pump(packets, input, columns, rows) : false;
+  },
+  closeMosh() {
+    if (mosh) mosh.close();
   },
   focus() {
     terminal.focus();

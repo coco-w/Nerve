@@ -21,6 +21,7 @@ constexpr int CONNECT_TIMEOUT_MS = 8000;
 constexpr int SSH_REQUEST_TIMEOUT_MS = 8000;
 constexpr int DAEMON_HEALTH_TIMEOUT_MS = 3200;
 constexpr size_t MAX_DAEMON_HEALTH_BYTES = 1024;
+constexpr size_t MAX_MOSH_START_BYTES = 4096;
 constexpr int MAX_PTY_DIMENSION = 500;
 
 bool IsAlphaNumeric(char ch)
@@ -108,6 +109,40 @@ void ClearSecret(std::string &value)
     }
 }
 
+std::string ShellQuote(const std::string &text)
+{
+    std::string quoted = "'";
+    for (char ch : text) {
+        if (ch == '\'') {
+            quoted += "'\"'\"'";
+        } else {
+            quoted += ch;
+        }
+    }
+    return quoted + "'";
+}
+
+// SSH 和 Mosh 使用相同的会话命令，通知仍由开发机的 Nerve CLI 校验归属。
+std::string TerminalCommand(const ConnectOptions &options)
+{
+    if (!options.pushLink.empty()) {
+        const auto &link = options.pushLink;
+        return "if ! command -v nerve >/dev/null 2>&1; then "
+            "echo \"SSH 用户的 PATH 中没有 nerve。请在主机安装 Nerve CLI 后重试。\"; exit 127; fi; "
+            "exec nerve attach-event " + link.substr(0, 36) + " " + link.substr(37);
+    }
+    if (options.zellijSession.empty()) {
+        return {};
+    }
+    // 会话名在进入此处前已校验，检查窗格列表以排除已停止的同名会话。
+    const auto &name = options.zellijSession;
+    return "if ! command -v zellij >/dev/null 2>&1; then "
+        "echo \"SSH 用户的 PATH 中没有 zellij。\"; exit 127; fi; "
+        "case \"$(zellij --session " + name + " action list-panes --json 2>/dev/null)\" in "
+        "\\[*) ;; *) echo \"找不到正在运行的 Zellij 会话：" + name + "\"; exit 1 ;; esac; "
+        "exec zellij attach " + name + " options --on-force-close detach";
+}
+
 } // namespace
 
 void ConnectOptions::ClearCredentials()
@@ -128,6 +163,9 @@ std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
     if (!options.pushLink.empty() && (!IsPushLink(options.pushLink) || !options.zellijSession.empty())) {
         throw std::runtime_error("通知关联标识无效。");
     }
+    if (options.moshPort < 0 || options.moshPort > 65535) {
+        throw std::runtime_error("Mosh UDP 端口无效。");
+    }
     ValidateSize(options.size);
 
     auto connection = Handshake(options.host, options.port);
@@ -142,8 +180,13 @@ std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
         connection->daemonHealth_ = connection->ReadDaemonHealth();
         libssh2_session_set_timeout(connection->session_, SSH_REQUEST_TIMEOUT_MS);
     }
-    connection->OpenPty(options);
-    libssh2_session_set_blocking(connection->session_, 0);
+    if (options.useMosh) {
+        connection->OpenMosh(options);
+        connection->CloseSsh();
+    } else {
+        connection->OpenPty(options);
+        libssh2_session_set_blocking(connection->session_, 0);
+    }
     return connection;
 }
 
@@ -204,9 +247,9 @@ void SshSession::Authenticate(const ConnectOptions &options) const
     }
 }
 
-std::string SshSession::ReadDaemonHealth() const
+int SshSession::RunCommand(const std::string &command, std::string &output, int timeout, size_t limit) const
 {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(DAEMON_HEALTH_TIMEOUT_MS);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
     const auto updateTimeout = [&]() {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now()).count();
@@ -216,32 +259,103 @@ std::string SshSession::ReadDaemonHealth() const
         libssh2_session_set_timeout(session_, static_cast<long>(remaining));
         return true;
     };
-    if (!updateTimeout()) {
-        return {};
-    }
     const auto release = [&](LIBSSH2_CHANNEL *channel) {
-        // 探测失败时仍可继续打开终端，临时通道的清理只短暂等待。
+        // 短命令结束后释放通道，清理只短暂等待。
         libssh2_session_set_timeout(session_, 100);
         libssh2_channel_free(channel);
+        libssh2_session_set_timeout(session_, SSH_REQUEST_TIMEOUT_MS);
     };
+    if (!updateTimeout()) {
+        return -1;
+    }
     std::unique_ptr<LIBSSH2_CHANNEL, decltype(release)> channel(libssh2_channel_open_session(session_), release);
-    constexpr const char *command = "/bin/sh -c 'command -v nerve >/dev/null 2>&1 && exec nerve health'";
-    if (!channel || !updateTimeout() || libssh2_channel_exec(channel.get(), command) != 0) {
-        return {};
+    if (!channel || libssh2_channel_handle_extended_data2(channel.get(), LIBSSH2_CHANNEL_EXTENDED_DATA_IGNORE) != 0 ||
+        !updateTimeout() || libssh2_channel_exec(channel.get(), command.c_str()) != 0) {
+        libssh2_session_set_timeout(session_, SSH_REQUEST_TIMEOUT_MS);
+        return -1;
     }
 
-    // 健康检查的 JSON 只交给应用解析，标准错误和过长输出不进入终端或绑定记录。
-    std::array<char, MAX_DAEMON_HEALTH_BYTES + 1> bytes {};
+    // 标准错误和过长输出不会进入界面，启动密钥也不会混入终端内容。
+    output.resize(limit + 1, '\0');
     size_t length = 0;
-    while (length < bytes.size() && updateTimeout()) {
-        const ssize_t count = libssh2_channel_read(channel.get(), bytes.data() + length, bytes.size() - length);
+    while (length < output.size() && updateTimeout()) {
+        const ssize_t count = libssh2_channel_read(channel.get(), output.data() + length, output.size() - length);
         if (count <= 0) {
-            return count == 0 && libssh2_channel_eof(channel.get()) &&
-                libssh2_channel_get_exit_status(channel.get()) == 0 ? std::string(bytes.data(), length) : std::string();
+            output.resize(length);
+            return count == 0 && libssh2_channel_eof(channel.get()) ?
+                libssh2_channel_get_exit_status(channel.get()) : -1;
         }
         length += static_cast<size_t>(count);
     }
-    return {};
+    return -1;
+}
+
+std::string SshSession::ReadDaemonHealth() const
+{
+    std::string output;
+    const int status = RunCommand("/bin/sh -c 'command -v nerve >/dev/null 2>&1 && exec nerve health'",
+        output, DAEMON_HEALTH_TIMEOUT_MS, MAX_DAEMON_HEALTH_BYTES);
+    return status == 0 ? output : std::string();
+}
+
+void SshSession::OpenMosh(const ConnectOptions &options)
+{
+    // -s 让服务端使用 SSH 到达的接口，避免在多网卡主机上从其他地址回复。
+    std::string script =
+        "command -v mosh-server >/dev/null 2>&1 || { echo NERVE_MOSH_UNAVAILABLE; exit 127; }; "
+        "if [ \"$(locale charmap 2>/dev/null)\" != UTF-8 ]; then "
+        "for lang in C.UTF-8 en_US.UTF-8; do "
+        "if [ \"$(LC_ALL=$lang locale charmap 2>/dev/null)\" = UTF-8 ]; then export LC_ALL=$lang; break; fi; "
+        "done; fi; "
+        // 保留远端设置，默认回收异常退出的客户端遗留的服务端进程。
+        "export MOSH_SERVER_NETWORK_TMOUT=\"${MOSH_SERVER_NETWORK_TMOUT:-86400}\"; "
+        "exec mosh-server new -s -c 256";
+    if (options.moshPort > 0) {
+        script += " -p " + std::to_string(options.moshPort);
+    }
+    const std::string terminal = TerminalCommand(options);
+    if (!terminal.empty()) {
+        script += " -- /bin/sh -c " + ShellQuote(terminal);
+    }
+    std::string output;
+    const int status = RunCommand("/bin/sh -c " + ShellQuote(script), output,
+        SSH_REQUEST_TIMEOUT_MS, MAX_MOSH_START_BYTES);
+    if (status == 127 || output == "NERVE_MOSH_UNAVAILABLE\n") {
+        ClearSecret(output);
+        throw std::runtime_error("在开发机的 SSH PATH 中找不到 mosh-server，请安装 Mosh 或选择 SSH。");
+    }
+    // 官方 mosh-server 的响应给出端口和 16 字节会话密钥的无填充 Base64。
+    static const std::regex ticket(R"((^|\n)MOSH CONNECT ([0-9]{1,5}) ([A-Za-z0-9+/]{21}[AQgw])\r?(\n|$))");
+    std::smatch match;
+    if (status == 0 && std::regex_search(output, match, ticket)) {
+        moshPort_ = std::stoi(match[2].str());
+        moshKey_.assign(match[3].first, match[3].second);
+    }
+    ClearSecret(output);
+    if (moshKey_.empty() || moshPort_ < 1 || moshPort_ > 65535 ||
+        (options.moshPort > 0 && moshPort_ != options.moshPort)) {
+        throw std::runtime_error("启动 mosh-server 失败，请检查 UDP 端口和开发机的 UTF-8 环境。");
+    }
+    mosh_ = std::make_unique<MoshUdp>(socket_, moshPort_);
+}
+
+void SshSession::ClearMoshKey()
+{
+    ClearSecret(moshKey_);
+}
+
+void SshSession::SendMoshDatagram(const uint8_t *buffer, size_t length) const
+{
+    if (mosh_) {
+        mosh_->Send(buffer, length);
+    }
+}
+
+void SshSession::RebindMosh()
+{
+    if (mosh_) {
+        mosh_->Rebind();
+    }
 }
 
 void SshSession::OpenPty(const ConnectOptions &options)
@@ -254,30 +368,17 @@ void SshSession::OpenPty(const ConnectOptions &options)
     if (libssh2_channel_handle_extended_data2(channel_, LIBSSH2_CHANNEL_EXTENDED_DATA_MERGE) != 0) {
         throw std::runtime_error("无法读取 SSH 终端的错误输出。");
     }
-    if (!options.pushLink.empty()) {
-        const auto &link = options.pushLink;
-        const std::string command = "/bin/sh -c 'if ! command -v nerve >/dev/null 2>&1; then "
-            "echo \"SSH 用户的 PATH 中没有 nerve。请在主机安装 Nerve CLI 后重试。\"; exit 127; fi; "
-            "exec nerve attach-event " + link.substr(0, 36) + " " + link.substr(37) + "'";
-        if (libssh2_channel_exec(channel_, command.c_str()) != 0) {
-            throw std::runtime_error("SSH 服务端未能启动通知会话。");
-        }
-    } else if (options.zellijSession.empty()) {
+    const auto terminal = TerminalCommand(options);
+    if (terminal.empty()) {
         if (libssh2_channel_shell(channel_) != 0) {
             throw std::runtime_error("SSH 服务端未能启动交互式终端。");
         }
     } else {
-        // 会话名已限制为普通标识符，远端命令仅附接指定的会话。
-        // Zellij 0.46 的部分查询失败仍返回 0，检查精确会话是否返回 JSON 窗格列表。
         // 使用 /bin/sh 解析固定条件语句，兼容远端的 Bash、Zsh 和 Fish 登录 Shell。
-        const std::string &name = options.zellijSession;
-        const std::string command = "/bin/sh -c 'if ! command -v zellij >/dev/null 2>&1; then "
-            "echo \"SSH 用户的 PATH 中没有 zellij。\"; exit 127; fi; "
-            "case \"$(zellij --session " + name + " action list-panes --json 2>/dev/null)\" in "
-            "\\[*) ;; *) echo \"找不到正在运行的 Zellij 会话：" + name + "\"; exit 1 ;; esac; "
-            "exec zellij attach " + name + " options --on-force-close detach'";
+        const std::string command = "/bin/sh -c " + ShellQuote(terminal);
         if (libssh2_channel_exec(channel_, command.c_str()) != 0) {
-            throw std::runtime_error("SSH 服务端未能启动 Zellij 附接命令。");
+            throw std::runtime_error(options.pushLink.empty() ? "SSH 服务端未能启动 Zellij 附接命令。" :
+                "SSH 服务端未能启动通知会话。");
         }
     }
 }
@@ -296,6 +397,9 @@ void SshSession::RequireOpen() const
 
 ssize_t SshSession::Read(uint8_t *buffer, size_t capacity)
 {
+    if (mosh_) {
+        return mosh_->Read(buffer, std::min(capacity, MOSH_MAX_DATAGRAM));
+    }
     RequireOpen();
     const ssize_t bytes = libssh2_channel_read(channel_, reinterpret_cast<char *>(buffer), capacity);
     if (bytes > 0) {
@@ -341,6 +445,13 @@ bool SshSession::Resize(PtySize size)
 }
 
 void SshSession::Close()
+{
+    ClearMoshKey();
+    mosh_.reset();
+    CloseSsh();
+}
+
+void SshSession::CloseSsh()
 {
     if (socket_ >= 0) {
         // 关闭 TCP 端点后再释放协议资源，避免退出页面时阻塞。

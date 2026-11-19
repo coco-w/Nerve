@@ -1,12 +1,12 @@
 # Nerve
 
-Nerve 是面向 HarmonyOS 的远程开发工具。手机通过 SSH 直连开发机的 Zellij 会话。主机上的 Nerve Daemon 采集 Codex Hooks 和 Oh My Pi（OMP）扩展事件，独立的 Push Gateway 负责把需要提醒的事件交给 Huawei Push Kit。
+Nerve 是面向 HarmonyOS 的远程开发工具。手机通过 SSH 或 Mosh 直连开发机的 Zellij 会话。主机上的 Nerve Daemon 采集 Codex Hooks 和 Oh My Pi（OMP）扩展事件，独立的 Push Gateway 负责把需要提醒的事件交给 Huawei Push Kit。
 
 ## 当前进度
 
-- `entry/` 是 HarmonyOS 原生应用。手机通过 libssh2 直连主机，终端由本地打包的 xterm.js 绘制。可打开 Shell 或接入已有 Zellij 会话。连接页和终端默认使用内置的 Maple Mono NF CN 7.9。 [字体发布](https://github.com/subframe7536/maple-font/releases/tag/v7.9) · [字体许可证](entry/src/main/resources/rawfile/licenses/maple-mono-OFL)
+- `entry/` 是 HarmonyOS 原生应用。终端由本地打包的 xterm.js 绘制。可用 SSH 或 Mosh 打开 Shell 或接入已有 Zellij 会话。连接页和终端默认使用内置的 Maple Mono NF CN 7.9。 [字体发布](https://github.com/subframe7536/maple-font/releases/tag/v7.9) · [字体许可证](entry/src/main/resources/rawfile/licenses/maple-mono-OFL)
 - `daemon/` 是 Node.js + TypeScript PoC。在同一系统用户下通过 Unix Socket 采集事件，写入 SQLite，并提供事件查询和 Zellij 会话、窗格列表。
-- Push Gateway 是独立运行的服务。Daemon 和 Gateway 分别用 SQLite 保存待发送通知，支持本地收件联调和 Huawei Push Kit V3。鸿蒙端提供通知授权、设备令牌导出和通知关联会话入口。后续验证 Mosh 和真机锁屏收通知。
+- Push Gateway 是独立运行的服务。Daemon 和 Gateway 分别用 SQLite 保存待发送通知，支持本地收件联调和 Huawei Push Kit V3。鸿蒙端提供通知授权、设备令牌导出和通知关联会话入口。
 
 ## 手机连接 SSH
 
@@ -32,6 +32,20 @@ cmake --build /tmp/nerve-ssh-build --target nerve_ssh_smoke --parallel
 ~~~
 
 如测试私钥带口令，可通过 `NERVE_SMOKE_KEY_PASSPHRASE` 传入。联调覆盖首次指纹探测、错误指纹、私钥登录、UTF-8 交互、终端尺寸同步和已有会话附接。
+
+## 手机连接 Mosh
+
+1. 在运行 Zellij 的开发机安装 Mosh。Ubuntu／WSL 可用 `sudo apt install mosh`，macOS 可用 `brew install mosh`。确认对应 SSH 账号的命令环境能找到 `mosh-server` 和 `zellij`。 [Mosh 官方安装说明](https://mosh.org/#getting)
+2. 在 Nerve 的「添加服务器」或「编辑」中选择 **Mosh**，沿用开发机的 SSH 端口和凭据。需要进入已有 Zellij 时填写会话名。保存后普通连接和通知打开会话都会使用该服务器的连接方式，旧记录默认使用 SSH。
+3. Mosh UDP 端口留空时由 `mosh-server` 从默认范围分配。防火墙或转发只开放了一个 UDP 端口时，可以填入该端口，每个固定端口同时服务一条连接。SSH 登录和 Mosh UDP 都直连开发机。切到流量后仍需能访问该地址和 UDP 端口。 [Mosh 端口设置](https://mosh.org/#usage)
+4. 短暂掉线时保留终端页面，待网络恢复后继续。主动点「断开」会结束 Mosh 连接，开发任务留在仍运行的 Zellij 会话。App 退出后可以重新连接并附接 Zellij。遗留的 Mosh 进程默认在 24 小时无客户端通信后退出，开发机可用 `MOSH_SERVER_NETWORK_TMOUT` 设置等待秒数。
+
+Mosh 的 UDP 由鸿蒙原生层收发，协议引擎复用 MIT 许可的 mosh-go，终端使用 xterm.js 渲染。常规 HAP 构建直接使用打包的 WASM。修改引擎后可在 WSL 或 Linux 重建，并用标准 `mosh-server` 验证保活、断网、换地址和主动关闭。 [协议引擎源码](https://github.com/unixshells/mosh-go/tree/8dca5c67ec8e09f71a4dc8eda9216f2f4ee7ec0f)
+
+~~~bash
+bash entry/src/main/mosh/build.sh
+node entry/src/main/mosh/test/roaming.cjs
+~~~
 
 ## 运行 Daemon
 
@@ -109,7 +123,7 @@ Gateway 默认监听 `127.0.0.1:8787`。跨机器使用时，可以用 HTTPS 反
 
 远程 HTTP 的 `NERVE_GATEWAY_URL` 使用 `http://<网关地址>:8787/v1/notifications`。Daemon 与 Gateway 都需要更新到支持签名的版本，并使用同一个随机 `NERVE_GATEWAY_TOKEN`。公网监听模式要求通知请求携带 HMAC-SHA256 签名，入库回执同样有签名。服务端接受五分钟内的签名，并按主机 ID 和事件 ID 去重。HTTP 上的事件元数据以明文传输。
 
-在手机上添加 SSH 服务器时，只需要填写 SSH 连接信息。点推送通知时，手机仍通过 SSH 直连触发通知的开发机。
+在手机上添加服务器时填写开发机的 SSH 登录信息并选择连接方式。点推送通知时，手机会直连触发通知的开发机。
 
 ### 本机联调
 
@@ -171,7 +185,7 @@ Gateway 开始投递其目录中待发送的通知。锁屏正文使用固定模
 
 用已保存的配置连接一次开发机。Nerve 通过已验证的 SSH 连接执行 `nerve health`，把 Daemon 主机 ID 保存在该服务器记录中。如果更换主机、端口或用户名，再连接时会重新绑定。
 
-点击通知后，匹配到唯一的服务器时，点「打开会话」就会用保存的凭据连接。尚无匹配或存在多个登录方式时，可手动选对应服务器，也可填写该主机的 SSH 凭据后点「连接并打开会话」。Nerve 校验 SSH 指纹和 Daemon 主机 ID，再按事件 ID 附接原来的 Zellij 会话。会话已关闭或改名时，终端显示原因。
+点击通知后，匹配到唯一的服务器时，点「打开会话」就会用保存的连接方式和凭据登录。尚无匹配或存在多个登录方式时，可手动选对应服务器，也可填写该主机的 SSH 凭据后点「连接并打开会话」。Nerve 校验 SSH 指纹和 Daemon 主机 ID，再按事件 ID 附接原来的 Zellij 会话。会话已关闭或改名时，终端会显示原因。
 
 ## 验收
 

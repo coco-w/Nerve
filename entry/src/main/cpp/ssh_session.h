@@ -10,6 +10,8 @@
 
 #include <libssh2.h>
 
+#include "mosh_udp.h"
+
 namespace nerve {
 
 struct PtySize {
@@ -29,6 +31,9 @@ struct ConnectOptions {
     PtySize size;
     std::string pushLink;
     bool discoverDaemon = false;
+    bool useMosh = false;
+    // 0 由 mosh-server 在默认范围内分配，正数指定单个可达的 UDP 端口。
+    int moshPort = 0;
 
     // 本地认证参数只用于建立连接，握手完成后清理原生侧副本。
     void ClearCredentials();
@@ -55,6 +60,11 @@ public:
     // 读返回 0 表示暂时无数据，-1 表示远端结束。
     ssize_t Read(uint8_t *buffer, size_t capacity);
     const std::string &DaemonHealth() const { return daemonHealth_; }
+    const std::string &MoshKey() const { return moshKey_; }
+    int MoshPort() const { return moshPort_; }
+    void ClearMoshKey();
+    void SendMoshDatagram(const uint8_t *buffer, size_t length) const;
+    void RebindMosh();
     int ExitStatus() const;
     size_t Write(const uint8_t *buffer, size_t length);
     bool Resize(PtySize size);
@@ -65,14 +75,21 @@ private:
     static std::unique_ptr<SshSession> Handshake(const std::string &host, int port);
     std::string Fingerprint() const;
     void Authenticate(const ConnectOptions &options) const;
+    // 在已认证的 SSH 上读取短命令输出，返回退出码，-1 表示传输失败。
+    int RunCommand(const std::string &command, std::string &output, int timeout, size_t limit) const;
     std::string ReadDaemonHealth() const;
     void OpenPty(const ConnectOptions &options);
+    void OpenMosh(const ConnectOptions &options);
     void RequireOpen() const;
+    void CloseSsh();
 
     int socket_ = -1;
     LIBSSH2_SESSION *session_ = nullptr;
     LIBSSH2_CHANNEL *channel_ = nullptr;
     std::string daemonHealth_;
+    std::unique_ptr<MoshUdp> mosh_;
+    std::string moshKey_;
+    int moshPort_ = 0;
 };
 
 } // namespace nerve

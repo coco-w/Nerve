@@ -3,8 +3,8 @@ import { preferences } from '@kit.ArkData';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
-import { connect, daemonHealth, disconnect, exitStatus, probeHostKey, read, resize, SshConnectOptions, SshError,
-  SshHandle, write } from 'libnerve_ssh.so';
+import { connect, daemonHealth, disconnect, exitStatus, probeHostKey, read, rebindMosh, resize, sendMoshDatagram,
+  SshConnectOptions, SshError, SshHandle, takeMoshInfo, write } from 'libnerve_ssh.so';
 import { hostIdFromDaemonHealth } from '../push/PushLink';
 import { PushSettings } from '../push/PushSettings';
 import { SavedSshServer, SshCredentials, SshServerSettings, SshServerStore } from '../ssh/SshServerStore';
@@ -18,6 +18,10 @@ const POLL_MS = 30;
 const MAX_CHUNK_BYTES = 16 * 1024;
 const MAX_QUEUED_BYTES = 64 * 1024;
 const MAX_KEY_BYTES = 32 * 1024;
+const MOSH_WASM_CHUNK = 64 * 1024;
+const MOSH_READ_BATCH = 24;
+const MOSH_MAX_ENCODED_PACKET = 2732;
+const MOSH_CLOSE_MS = 1500;
 // nerve attach-event 用此状态报告原 Zellij 会话已关闭。
 const SESSION_UNAVAILABLE_EXIT_STATUS = 20;
 // 应用本地的 SSH 信任记录，按主机和端口保存指纹。
@@ -41,19 +45,29 @@ interface SshOpenRequest {
   server?: SavedSshServer;
 }
 
-// 渲染层只传终端输入、尺寸和渲染确认，连接信息及凭据由 ArkTS 持有。
+interface MoshBridgeCallbacks {
+  wasm: (offset: number) => string;
+  key: () => string;
+  datagram: (encoded: string) => void;
+  rebind: () => void;
+  state: (status: string) => void;
+}
+
+// 由内置 Web 终端调用。SSH 凭据留在应用，Mosh 引擎只取一次临时会话密钥。
 class TerminalBridge {
   private readonly input: (text: string) => void;
   private readonly binaryInput: (encoded: string) => void;
   private readonly size: (columns: number, rows: number) => void;
   private readonly outputFlushed: () => void;
+  private readonly mosh: MoshBridgeCallbacks;
 
   constructor(input: (text: string) => void, binaryInput: (encoded: string) => void,
-    size: (columns: number, rows: number) => void, outputFlushed: () => void) {
+    size: (columns: number, rows: number) => void, outputFlushed: () => void, mosh: MoshBridgeCallbacks) {
     this.input = input;
     this.binaryInput = binaryInput;
     this.size = size;
     this.outputFlushed = outputFlushed;
+    this.mosh = mosh;
   }
 
   onInput(text: string): void {
@@ -70,6 +84,26 @@ class TerminalBridge {
 
   onOutputFlushed(): void {
     this.outputFlushed();
+  }
+
+  onMoshWasm(offset: number): string {
+    return this.mosh.wasm(offset);
+  }
+
+  onMoshKey(): string {
+    return this.mosh.key();
+  }
+
+  onMoshDatagram(encoded: string): void {
+    this.mosh.datagram(encoded);
+  }
+
+  onMoshRebind(): void {
+    this.mosh.rebind();
+  }
+
+  onMoshState(status: string): void {
+    this.mosh.state(status);
   }
 }
 
@@ -90,6 +124,8 @@ struct Index {
   @State private port: string = '22';
   @State private username: string = '';
   @State private zellijSession: string = '';
+  @State private useMosh: boolean = false;
+  @State private moshPortInput: string = '';
   @State private usePrivateKey: boolean = false;
   @State private keySelected: boolean = false;
   @State private password: string = '';
@@ -99,6 +135,7 @@ struct Index {
   @State private terminalVisible: boolean = false;
   @State private terminalInstance: number = 0;
   @State private connected: boolean = false;
+  @State private closingMosh: boolean = false;
   @State private statusText: string = '';
   @State private errorText: string = '';
   @State private ctrlArmed: boolean = false;
@@ -114,6 +151,12 @@ struct Index {
   // 连接代次会在退出时增加，丢弃此前未完成的握手和渲染回调。
   private generation: number = 0;
   private connection: SshHandle | undefined;
+  private moshActive: boolean = false;
+  private moshPort: number = 0;
+  private moshWasm: Uint8Array | undefined;
+  private moshPumpPending: boolean = false;
+  private moshCloseTimer: number = -1;
+  private afterMoshClose: (() => void) | undefined;
   // 等待确认或终端准备时，已保存的服务器只携带配置，不提前读取凭据。
   private pendingTrustConnection: SshOpenRequest | undefined;
   private pendingConnection: SshOpenRequest | undefined;
@@ -152,7 +195,7 @@ struct Index {
       return true;
     }
     if (this.terminalVisible) {
-      this.backToForm();
+      this.closeTerminal(() => this.backToForm());
       return true;
     }
     if (this.managingServers) {
@@ -184,11 +227,15 @@ struct Index {
     if (!server || !link || this.managingServers || this.checkingHostKey) {
       return;
     }
-    if (this.terminalVisible) {
-      this.backToForm();
-    }
     // 收到或点击系统通知只选中服务器，由用户点「打开会话」后才读取凭据。
-    this.startConnection(server, link);
+    if (this.terminalVisible) {
+      this.closeTerminal(() => {
+        this.backToForm();
+        this.startConnection(server, link);
+      });
+    } else {
+      this.startConnection(server, link);
+    }
   }
 
   private useSavedServer(id: number, edit: boolean): void {
@@ -254,6 +301,8 @@ struct Index {
     this.port = server ? String(server.port) : '22';
     this.username = server?.username ?? '';
     this.zellijSession = server?.zellijSession ?? '';
+    this.useMosh = server?.useMosh ?? false;
+    this.moshPortInput = server?.moshPort ? String(server.moshPort) : '';
     this.usePrivateKey = server?.usePrivateKey ?? false;
     this.serverEditorOpen = isOpen;
   }
@@ -281,7 +330,13 @@ struct Index {
       this.errorText = '会话名可使用字母、数字、下划线、点和连字符。留空后可在终端中手动附接。';
       return undefined;
     }
-    return { host, port, username, zellijSession, usePrivateKey: this.usePrivateKey };
+    const udpPort = this.useMosh ? this.moshPortInput.trim() : '';
+    const moshPort = udpPort ? Number(udpPort) : 0;
+    if (udpPort && (!/^\d{1,5}$/.test(udpPort) || moshPort < 1 || moshPort > 65535)) {
+      this.errorText = 'Mosh UDP 端口应为 1–65535，留空使用开发机分配的端口。';
+      return undefined;
+    }
+    return { host, port, username, zellijSession, usePrivateKey: this.usePrivateKey, useMosh: this.useMosh, moshPort };
   }
 
   private formCredentials(): SshCredentials | undefined {
@@ -448,7 +503,7 @@ struct Index {
       host: settings.host, port: settings.port, username: settings.username, fingerprint: '',
       password: credentials?.password ?? '', privateKey: credentials?.privateKey ?? '',
       passphrase: credentials?.passphrase ?? '', zellijSession: pushLink ? '' : settings.zellijSession,
-      pushLink, columns: 80, rows: 24,
+      pushLink, columns: 80, rows: 24, useMosh: settings.useMosh, moshPort: settings.moshPort,
       // 已匹配的通知由 attach-event 再校验主机，普通连接和手动选择会刷新绑定。
       discoverDaemon: server !== undefined && (!pushLink || server.daemonHostId !== pushLink.slice(0, 36))
     };
@@ -545,6 +600,7 @@ struct Index {
     this.checkingHostKey = false;
     this.pendingConnection = request;
     this.receivedTerminalOutput = false;
+    this.moshActive = request.options.useMosh === true;
     this.openedPushLink = request.options.pushLink;
     this.openedRemoteTitle = request.options.zellijSession || (request.options.pushLink ?
       this.knownHostId(request.options.host, request.options.port) : request.options.host);
@@ -569,13 +625,21 @@ struct Index {
   }
 
   private createBridge(generation: number): TerminalBridge {
+    const current = (): boolean => this.generation === generation;
     return new TerminalBridge(
-      (text: string) => { if (this.generation === generation) this.queueText(text); },
-      (encoded: string) => { if (this.generation === generation) this.queueBinary(encoded); },
-      (columns: number, rows: number) => {
-        if (this.generation === generation) this.onTerminalSize(columns, rows);
-      },
-      () => { if (this.generation === generation) this.renderPending = false; }
+      (text: string) => { if (current()) this.queueText(text); },
+      (encoded: string) => { if (current()) this.queueBinary(encoded); },
+      (columns: number, rows: number) => { if (current()) this.onTerminalSize(columns, rows); },
+      () => { if (current()) this.renderPending = false; },
+      {
+        wasm: (offset: number): string => current() ? this.moshWasmChunk(offset) : '',
+        key: (): string => current() ? this.takeMoshKey() : '',
+        datagram: (encoded: string) => { if (current()) this.writeMoshPacket(encoded); },
+        rebind: () => {
+          if (current() && this.moshActive && this.connection) rebindMosh(this.connection);
+        },
+        state: (status: string) => { if (current()) this.onMoshState(status); }
+      }
     );
   }
 
@@ -599,7 +663,7 @@ struct Index {
   private async openConnection(request: SshOpenRequest, generation: number): Promise<void> {
     const options = request.options;
     try {
-      this.statusText = '正在连接 SSH';
+      this.statusText = options.useMosh ? '正在通过 SSH 启动 Mosh' : '正在连接 SSH';
       if (request.server) {
         const credentials = await this.savedServerStore().credentials(request.server);
         if (this.generation !== generation) {
@@ -624,8 +688,13 @@ struct Index {
         return;
       }
       this.connection = connection;
-      this.connected = true;
-      this.statusText = 'SSH 已连接';
+      if (this.moshActive) {
+        this.statusText = '正在连接 Mosh';
+        this.runTerminalScript('window.nerveTerminal.startMosh(' + options.columns + ',' + options.rows + ')');
+      } else {
+        this.connected = true;
+        this.statusText = 'SSH 已连接';
+      }
       this.ioTimer = setInterval(() => this.pumpTerminal(), POLL_MS);
       if (request.server && options.discoverDaemon) {
         this.rememberDaemonHost(request.server, connection);
@@ -644,7 +713,7 @@ struct Index {
             reconnect: request.server !== undefined
           };
         } else {
-          this.failOpening(failure.message || 'SSH 连接失败。');
+          this.failOpening(failure.message || (options.useMosh ? 'Mosh 连接失败。' : 'SSH 连接失败。'));
         }
       }
     }
@@ -660,7 +729,8 @@ struct Index {
       if (await this.savedServerStore().bindDaemonHost(server, daemonHostId)) {
         const updated: SavedSshServer = {
           id: server.id, host: server.host, port: server.port, username: server.username,
-          zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId
+          zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId,
+          useMosh: server.useMosh, moshPort: server.moshPort
         };
         this.savedServers = this.savedServers.map((item: SavedSshServer): SavedSshServer =>
           item.id === updated.id ? updated : item);
@@ -677,6 +747,85 @@ struct Index {
     this.errorText = message;
   }
 
+  private moshWasmChunk(offset: number): string {
+    if (!this.moshActive || !this.connection || !Number.isInteger(offset) || offset < 0 ||
+      offset % MOSH_WASM_CHUNK !== 0) {
+      return '';
+    }
+    if (offset === 0) {
+      // 桥接只提供一个固定资源，不向终端页面开放文件或网络访问。
+      this.moshWasm = this.getUIContext().getHostContext()?.resourceManager
+        .getRawFileContentSync('terminal/vendor/nerve-mosh.wasm');
+    }
+    const wasm = this.moshWasm;
+    if (!wasm || offset >= wasm.length) {
+      this.moshWasm = undefined;
+      return '';
+    }
+    return this.base64.encodeToStringSync(wasm.subarray(offset, offset + MOSH_WASM_CHUNK));
+  }
+
+  private takeMoshKey(): string {
+    if (!this.moshActive || !this.connection) {
+      return '';
+    }
+    const info = takeMoshInfo(this.connection);
+    this.moshPort = info.port;
+    return info.key;
+  }
+
+  private writeMoshPacket(encoded: string): void {
+    if (this.moshActive && this.connection && encoded.length <= MOSH_MAX_ENCODED_PACKET) {
+      const packet = this.base64.decodeSync(encoded);
+      sendMoshDatagram(this.connection, packet.buffer);
+    }
+  }
+
+  private onMoshState(status: string): void {
+    if (!this.moshActive) {
+      return;
+    }
+    if (this.closingMosh) {
+      if (status === 'closed' || status === 'error') this.finishMoshClose();
+      return;
+    }
+    if (status === 'online') {
+      this.connected = true;
+      this.statusText = 'Mosh 已连接';
+    } else if (status === 'waiting') {
+      const port = ' · UDP ' + this.moshPort;
+      this.statusText = this.connected ? 'Mosh 等待网络恢复' + port : '等待 Mosh 响应' + port;
+    } else if (status === 'ended') {
+      this.stopConnection();
+      this.statusText = '远端 Mosh 会话已结束';
+    } else if (status === 'error') {
+      this.onTerminalError();
+    }
+  }
+
+  // 主动离开或打开另一条通知时，先完成 Mosh 关闭握手，释放开发机的 UDP 端口。
+  private closeTerminal(afterClose: () => void): void {
+    if (this.closingMosh) {
+      return;
+    }
+    if (!this.moshActive || !this.connection || !this.moshPort) {
+      afterClose();
+      return;
+    }
+    this.closingMosh = true;
+    this.connected = false;
+    this.statusText = '正在断开 Mosh';
+    this.afterMoshClose = afterClose;
+    this.moshCloseTimer = setTimeout(() => this.finishMoshClose(), MOSH_CLOSE_MS);
+    this.runTerminalScript('window.nerveTerminal.closeMosh()');
+  }
+
+  private finishMoshClose(): void {
+    const afterClose = this.afterMoshClose;
+    this.afterMoshClose = undefined;
+    if (afterClose) afterClose();
+  }
+
   private backToForm(): void {
     this.stopConnection();
     this.terminalVisible = false;
@@ -688,8 +837,16 @@ struct Index {
     this.generation++;
     clearTimeout(this.loadTimer);
     clearInterval(this.ioTimer);
+    clearTimeout(this.moshCloseTimer);
     this.loadTimer = -1;
     this.ioTimer = -1;
+    this.moshCloseTimer = -1;
+    this.afterMoshClose = undefined;
+    this.moshActive = false;
+    this.moshPort = 0;
+    this.moshWasm = undefined;
+    this.moshPumpPending = false;
+    this.closingMosh = false;
     this.pendingConnection = undefined;
     const connection = this.connection;
     this.connection = undefined;
@@ -761,9 +918,52 @@ struct Index {
     return !this.writePending;
   }
 
+  private async pumpMosh(connection: SshHandle, generation: number): Promise<void> {
+    if (this.moshPumpPending) {
+      return;
+    }
+    this.moshPumpPending = true;
+    try {
+      // UDP 保留数据报边界，每帧限制桥接和解包的开销。
+      const datagrams: string[] = [];
+      for (let i = 0; i < MOSH_READ_BATCH; i++) {
+        const packet = read(connection);
+        if (!packet || packet.byteLength === 0) {
+          break;
+        }
+        datagrams.push(this.base64.encodeToStringSync(new Uint8Array(packet)));
+      }
+      const chunk = this.closingMosh ? undefined : this.inputQueue[0];
+      const currentSize = this.latestSize;
+      const changed = !this.closingMosh &&
+        (currentSize.columns !== this.sentSize.columns || currentSize.rows !== this.sentSize.rows);
+      if (!datagrams.length && !chunk && !changed) {
+        return;
+      }
+      const input = chunk ? this.base64.encodeToStringSync(new Uint8Array(chunk)) : '';
+      const result = await this.view.runJavaScript('window.nerveTerminal.pumpMosh(' + JSON.stringify(datagrams) + ',' +
+        JSON.stringify(input) + ',' + (changed ? currentSize.columns : 0) + ',' + (changed ? currentSize.rows : 0) + ')');
+      if (this.generation === generation && result === 'true') {
+        if (changed) this.sentSize = currentSize;
+        if (chunk) {
+          this.inputQueue.shift();
+          this.queuedBytes -= chunk.byteLength;
+        }
+      }
+    } catch (_) {
+      if (this.generation === generation) this.onTerminalError();
+    } finally {
+      if (this.generation === generation) this.moshPumpPending = false;
+    }
+  }
+
   private pumpTerminal(): void {
     const connection = this.connection;
     if (!connection) {
+      return;
+    }
+    if (this.moshActive) {
+      this.pumpMosh(connection, this.generation);
       return;
     }
     try {
@@ -819,12 +1019,17 @@ struct Index {
   }
 
   private onTerminalError(): void {
+    if (this.closingMosh) {
+      this.finishMoshClose();
+      return;
+    }
+    const mosh = this.moshActive;
     if (this.connected) {
       this.stopConnection();
-      this.statusText = 'SSH 已断开';
+      this.statusText = mosh ? 'Mosh 已断开' : 'SSH 已断开';
       this.errorText = '终端显示中断，请重新连接。';
     } else if (this.terminalVisible) {
-      this.failOpening('无法加载内置终端，请重试。');
+      this.failOpening(mosh ? '无法启动内置 Mosh 客户端，请重试。' : '无法加载内置终端，请重试。');
     }
   }
 
@@ -851,16 +1056,16 @@ struct Index {
   }
 
   @Builder
-  authButton(label: string, useKey: boolean) {
+  optionButton(label: string, selected: boolean, action: () => void) {
     Button(label, { type: ButtonType.Normal })
       .layoutWeight(1)
       .height(38)
       .borderRadius(8)
       .fontFamily(APP_FONT)
       .fontSize(14)
-      .fontColor(this.usePrivateKey === useKey ? BACKGROUND : FOREGROUND)
-      .backgroundColor(this.usePrivateKey === useKey ? ACCENT : SURFACE)
-      .onClick(() => this.changeAuth(useKey))
+      .fontColor(selected ? BACKGROUND : FOREGROUND)
+      .backgroundColor(selected ? ACCENT : SURFACE)
+      .onClick(action)
   }
 
   @Builder
@@ -895,7 +1100,8 @@ struct Index {
         Text(this.knownHostId(server.host, server.port))
           .fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(server.username + (server.zellijSession ? ' · ' + server.zellijSession : ''))
+        Text(server.username + (server.zellijSession ? ' · ' + server.zellijSession : '') +
+          (server.useMosh ? ' · Mosh' : ' · SSH'))
           .fontFamily(APP_FONT).fontSize(12).fontColor(MUTED)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
       }.layoutWeight(1).alignItems(HorizontalAlign.Start)
@@ -938,7 +1144,7 @@ struct Index {
           (value: string) => { this.username = value; })
       }.layoutWeight(2)
       Column() {
-        this.field('端口', this.port, '22', InputType.Number, 5,
+        this.field('SSH 端口', this.port, '22', InputType.Number, 5,
           (value: string) => { this.port = value; })
       }.layoutWeight(1)
     }.width('100%')
@@ -947,8 +1153,16 @@ struct Index {
         (value: string) => { this.zellijSession = value; })
     }
     Row({ space: 8 }) {
-      this.authButton('密码', false)
-      this.authButton('私钥', true)
+      this.optionButton('SSH', !this.useMosh, () => { this.useMosh = false; })
+      this.optionButton('Mosh', this.useMosh, () => { this.useMosh = true; })
+    }.width('100%')
+    if (this.useMosh) {
+      this.field('Mosh UDP 端口', this.moshPortInput, '可选 · 自动分配', InputType.Number, 5,
+        (value: string) => { this.moshPortInput = value; })
+    }
+    Row({ space: 8 }) {
+      this.optionButton('密码', !this.usePrivateKey, () => this.changeAuth(false))
+      this.optionButton('私钥', this.usePrivateKey, () => this.changeAuth(true))
     }.width('100%')
     if (this.usePrivateKey) {
       Button(this.keySelected ? '已选私钥 · 更换' : this.canKeepSavedCredentials() ? '已保存私钥 · 更换' : '选择私钥文件',
@@ -1031,7 +1245,7 @@ struct Index {
             .borderRadius(10)
           Column({ space: 2 }) {
             Text('Nerve').fontFamily(APP_FONT).fontSize(25).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
-            Text(this.serverEditorOpen ? this.editingServer ? '编辑服务器' : '添加服务器' : 'SSH 连接')
+            Text(this.serverEditorOpen ? this.editingServer ? '编辑服务器' : '添加服务器' : '远程连接')
               .fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
           }.alignItems(HorizontalAlign.Start).layoutWeight(1)
           Button(this.serverEditorOpen ? '返回' : '推送通知', { type: ButtonType.Normal })
@@ -1137,19 +1351,20 @@ struct Index {
           Button(this.notificationServer ? '打开会话' : '查看通知', { type: ButtonType.Normal })
             .height(34).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
             .fontColor(BACKGROUND).backgroundColor(ACCENT)
-            .enabled(!this.managingServers)
+            .enabled(!this.managingServers && !this.closingMosh)
             .onClick(() => {
               if (this.notificationServer) {
                 this.openMatchedNotification();
               } else {
-                this.backToForm();
+                this.closeTerminal(() => this.backToForm());
               }
             })
         }
-        Button(this.connected ? '断开' : '返回', { type: ButtonType.Normal })
+        Button(this.connected || this.closingMosh ? '断开' : '返回', { type: ButtonType.Normal })
           .height(34).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
           .fontColor(FOREGROUND).backgroundColor(SURFACE)
-          .onClick(() => this.backToForm())
+          .enabled(!this.closingMosh)
+          .onClick(() => this.closeTerminal(() => this.backToForm()))
       }.width('100%').padding({ left: 12, top: 8, right: 12, bottom: 8 })
       Web({ src: $rawfile('terminal/index.html'), controller: this.view })
         .width('100%')
@@ -1164,7 +1379,8 @@ struct Index {
         .javaScriptProxy({
           object: this.bridge,
           name: 'nerveHost',
-          methodList: ['onSize', 'onInput', 'onBinary', 'onOutputFlushed'],
+          methodList: ['onSize', 'onInput', 'onBinary', 'onOutputFlushed',
+            'onMoshWasm', 'onMoshKey', 'onMoshDatagram', 'onMoshRebind', 'onMoshState'],
           controller: this.view
         })
         .onLoadIntercept(event => {

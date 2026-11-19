@@ -2,7 +2,8 @@ import { common } from '@kit.AbilityKit';
 import { relationalStore } from '@kit.ArkData';
 
 const TABLE = 'ssh_servers';
-const SERVER_COLUMNS = ['id', 'host', 'port', 'username', 'zellij_session', 'use_private_key', 'daemon_host_id'];
+const SERVER_COLUMNS = ['id', 'host', 'port', 'username', 'zellij_session', 'use_private_key', 'daemon_host_id',
+  'use_mosh', 'mosh_port'];
 const CREDENTIAL_COLUMNS = ['password', 'private_key', 'passphrase'];
 // 由鸿蒙生成和保管加密数据库的密钥，数据库目录配置为不参与应用备份。
 const STORE_CONFIG: relationalStore.StoreConfig = {
@@ -18,6 +19,9 @@ export interface SshServerSettings {
   username: string;
   zellijSession: string;
   usePrivateKey: boolean;
+  useMosh: boolean;
+  // 旧服务器默认使用 SSH，Mosh UDP 端口 0 表示由开发机分配。
+  moshPort: number;
 }
 
 export interface SavedSshServer extends SshServerSettings {
@@ -53,18 +57,28 @@ export class SshServerStore {
       private_key TEXT NOT NULL DEFAULT '',
       passphrase TEXT NOT NULL DEFAULT '',
       daemon_host_id TEXT NOT NULL DEFAULT '',
+      use_mosh INTEGER NOT NULL DEFAULT 0,
+      mosh_port INTEGER NOT NULL DEFAULT 0,
       UNIQUE(host, port, username)
     )`);
     // 原地升级已有的加密库，保留服务器记录和 SSH 凭据。
-    const column = await db.querySql(`SELECT name FROM pragma_table_info('${TABLE}') WHERE name = 'daemon_host_id'`);
-    let hasBindingColumn = false;
+    const columns = await db.querySql(`SELECT name FROM pragma_table_info('${TABLE}')`);
+    const names = new Set<string>();
     try {
-      hasBindingColumn = column.goToFirstRow();
+      while (columns.goToNextRow()) {
+        names.add(columns.getString(0));
+      }
     } finally {
-      column.close();
+      columns.close();
     }
-    if (!hasBindingColumn) {
+    if (!names.has('daemon_host_id')) {
       await db.executeSql(`ALTER TABLE ${TABLE} ADD COLUMN daemon_host_id TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!names.has('use_mosh')) {
+      await db.executeSql(`ALTER TABLE ${TABLE} ADD COLUMN use_mosh INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!names.has('mosh_port')) {
+      await db.executeSql(`ALTER TABLE ${TABLE} ADD COLUMN mosh_port INTEGER NOT NULL DEFAULT 0`);
     }
     return db;
   }
@@ -98,7 +112,9 @@ export class SshServerStore {
           username: rows.getString(rows.getColumnIndex('username')),
           zellijSession: rows.getString(rows.getColumnIndex('zellij_session')),
           usePrivateKey: rows.getLong(rows.getColumnIndex('use_private_key')) === 1,
-          daemonHostId: rows.getString(rows.getColumnIndex('daemon_host_id'))
+          daemonHostId: rows.getString(rows.getColumnIndex('daemon_host_id')),
+          useMosh: rows.getLong(rows.getColumnIndex('use_mosh')) === 1,
+          moshPort: rows.getLong(rows.getColumnIndex('mosh_port'))
         });
       }
       return servers;
@@ -137,7 +153,9 @@ export class SshServerStore {
       port: server.port,
       username: server.username,
       zellij_session: server.zellijSession,
-      use_private_key: server.usePrivateKey ? 1 : 0
+      use_private_key: server.usePrivateKey ? 1 : 0,
+      use_mosh: server.useMosh ? 1 : 0,
+      mosh_port: server.moshPort
     };
     if (credentials) {
       values['password'] = credentials.password;
@@ -170,7 +188,8 @@ export class SshServerStore {
     }
     return {
       id: savedId, host: server.host, port: server.port, username: server.username,
-      zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId
+      zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId,
+      useMosh: server.useMosh, moshPort: server.moshPort
     };
   }
 
