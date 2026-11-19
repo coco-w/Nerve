@@ -8,6 +8,39 @@ Nerve 是面向 HarmonyOS 的远程开发工具。手机通过 SSH 或 Mosh 直�
 - `daemon/` 是 Node.js + TypeScript PoC。在同一系统用户下通过 Unix Socket 采集事件，写入 SQLite，并提供事件查询和 Zellij 会话、窗格列表。
 - Push Gateway 是独立运行的服务。Daemon 和 Gateway 分别用 SQLite 保存待发送通知，支持本地收件联调和 Huawei Push Kit V3。鸿蒙端提供通知授权、设备令牌导出和通知关联会话入口。
 
+## 架构图
+
+~~~mermaid
+flowchart LR
+    App["HarmonyOS<br/>Nerve App"]
+
+    subgraph Host["每台开发机 · Linux / macOS / WSL"]
+        direction TB
+        Remote["SSH 服务<br/>可选 mosh-server"]
+        Zellij["Zellij 窗格<br/>Codex / OMP"]
+        Daemon["Nerve Daemon"]
+        Events[("SQLite<br/>事件与通知队列")]
+
+        Remote -->|附接会话| Zellij
+        Zellij -->|Hooks 或扩展 · Unix Socket| Daemon
+        Daemon <--> Events
+    end
+
+    subgraph Push["共享推送 · 可选"]
+        direction TB
+        Gateway["Push Gateway<br/>SQLite 通知队列"]
+        Huawei["Huawei Push Kit"]
+
+        Gateway -->|服务账号鉴权| Huawei
+    end
+
+    App <-->|SSH 或 Mosh 直连| Host
+    Host -.->|提醒事件 · HTTP / HTTPS| Push
+    Push -.->|系统通知| App
+~~~
+
+手机直连开发机使用终端。Gateway 集中转发提醒，华为服务账号 JSON 和手机 Push Token 配置在 Gateway 所在机器。点击通知后，Nerve 按主机 ID 匹配已保存的服务器。点「打开会话」后，App 连接到开发机，按事件 ID 附接对应的 Zellij 会话。
+
 ## 手机连接 SSH
 
 1. 确认手机能访问开发机的 SSH 服务。使用运行 Zellij 的同一个远端用户登录。自动附接按 Zellij 0.46.0 联调，要求 `zellij` 位于该用户远端命令的 `PATH` 中。会话名可以用 `zellij list-sessions` 查看。
@@ -47,21 +80,31 @@ bash entry/src/main/mosh/build.sh
 node entry/src/main/mosh/test/roaming.cjs
 ~~~
 
-## 运行 Daemon
+## 在新电脑上安装 Daemon
 
-在 WSL 或 Linux 操作。Node.js 需为 24.14 或更高版本。使用 `sessions` 和 `panes` 命令时，`zellij` 需在 `PATH` 中。联调使用 Zellij 0.46.0。本机通过 WSL Bash 运行时，可用 `export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"` 临时加入 Homebrew 安装的 Zellij。建议让 Daemon、Codex、OMP 和 Zellij 在同一 Linux 用户下运行。
+在实际运行 Codex、OMP 和 Zellij 的环境装一份 Daemon，并使用同一个系统账号。开发机可用 Linux 或 macOS。Windows 开发机在对应的 WSL 发行版里安装依赖和 Daemon。
+
+| 用途 | 开发机需要准备 |
+| --- | --- |
+| 安装并运行 Daemon | Node.js 24.14.0 或更高版本、npm 和本仓库源码。SQLite 由 Node.js 提供。 [Node.js 下载](https://nodejs.org/en/download) |
+| 保留和附接开发会话 | Zellij，当前联调版本为 0.46.0，确保登录账号可以执行 `zellij`。 [Zellij 安装说明](https://zellij.dev/documentation/installation) |
+| 采集开发事件 | 安装并配置实际使用的 Codex CLI 或 Oh My Pi，再启用下方对应的 Hook 或扩展。 |
+| 手机连接 | 启用 SSH 服务，让手机能访问开发机的 SSH 端口。使用 Mosh 时再安装 `mosh-server` 并提供可达的 UDP 端口。 [SSH 连接](#手机连接-ssh) · [Mosh 连接](#手机连接-mosh) |
+| 手机收推送 | 使用已有 Push Gateway 时，在启动 Daemon 前设置 `NERVE_GATEWAY_URL` 和对应的 `NERVE_GATEWAY_TOKEN`。 [共用网关配置](#多台开发机共用一个-gateway) |
+
+把仓库放在开发机上，从仓库根目录执行以下命令。
 
 ~~~bash
-cd /mnt/d/Huawei/Nerve/daemon
+cd daemon
 npm ci
-npm test
+npm run build
 npm start
 ~~~
 
-在另一个终端执行：
+`npm start` 在前台运行 Daemon。打开另一终端，从仓库根目录执行以下命令检查是否启动成功。健康检查返回 `status: "ok"` 和当前开发机的 `hostId`。
 
 ~~~bash
-cd /mnt/d/Huawei/Nerve/daemon
+cd daemon
 node dist/cli.js health
 node dist/cli.js sessions
 node dist/cli.js panes "你的会话名"
@@ -69,9 +112,13 @@ node dist/cli.js events        # 从游标 0 读取前 50 条
 node dist/cli.js events 0 10   # 从游标 0 读取前 10 条
 ~~~
 
-`NERVE_HOME` 默认为 `~/.nerve`，内含 `nerve.sock` 和 `events.sqlite`。如需自定义，在 Daemon 和 Agent 启动前设置同一个绝对路径。目录需位于 Linux 文件系统并由当前用户独占访问（`0700`）。正常停止时 Socket 会被清理。若强制终止后重启遇到 `EADDRINUSE`，确认没有 Daemon 监听后再删除残留的 `nerve.sock`。
+`NERVE_HOME` 默认为 `~/.nerve`，内含 `nerve.sock` 和 `events.sqlite`。如需自定义，在 Daemon 和 Agent 启动前设置同一个绝对路径。目录须支持 Unix Socket 并由当前用户独占访问（`0700`）。在 WSL 中使用发行版内的 Linux 文件系统。正常停止时 Socket 会被清理。若强制终止后重启遇到 `EADDRINUSE`，确认没有 Daemon 监听后再删除残留的 `nerve.sock`。
+
+要让手机点击通知后直接打开会话，需要让 SSH 登录运行 `nerve`。 [配置通知会话入口](#从通知打开-zellij-会话)
 
 ### Codex
+
+在仓库的 `daemon/` 目录生成 Hook 配置。
 
 ~~~bash
 node dist/cli.js codex-config > /tmp/nerve-codex-hooks.json
@@ -84,7 +131,7 @@ node dist/cli.js codex-config > /tmp/nerve-codex-hooks.json
 从希望关联的 Zellij 窗格启动，将扩展路径替换为本机的绝对路径。
 
 ~~~bash
-omp -e /mnt/d/Huawei/Nerve/daemon/adapters/omp/extension.ts
+omp -e "/你的仓库路径/Nerve/daemon/adapters/omp/extension.ts"
 ~~~
 
 扩展通过 OMP 自己的加载器运行，并复用已经构建的 Daemon 模块。 [OMP 18.22.2 扩展文档](https://github.com/can1357/oh-my-pi/blob/v18.22.2/docs/extensions.md)
@@ -181,7 +228,7 @@ Gateway 开始投递其目录中待发送的通知。锁屏正文使用固定模
 
 ### 从通知打开 Zellij 会话
 
-在触发通知的开发机（WSL 或 macOS）用运行 Daemon 的同一个系统用户将构建后的 `nerve` 加入 SSH 用户的 `PATH`，例如从本项目的 `daemon/` 运行 `npm run build && npm link`。若 Daemon 使用自定义 `NERVE_HOME`，让 SSH 的非交互命令也能读到该值。
+在触发通知的开发机上，用运行 Daemon 的同一个系统账号，在已构建的 `daemon/` 目录执行 `npm link`。让 SSH 的非交互命令能从 `PATH` 找到 `node` 和 `nerve`。若 Daemon 使用自定义 `NERVE_HOME`，让 SSH 的非交互命令也能读到该值。
 
 用已保存的配置连接一次开发机。Nerve 通过已验证的 SSH 连接执行 `nerve health`，把 Daemon 主机 ID 保存在该服务器记录中。如果更换主机、端口或用户名，再连接时会重新绑定。
 
