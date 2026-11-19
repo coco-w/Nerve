@@ -2,6 +2,7 @@
 import { getAsset, isSea } from 'node:sea';
 import { fileURLToPath } from 'node:url';
 import { fromCodexHook, isRecord, parseAgentEvent, uuidPattern } from './agent.js';
+import { daemonReadyMessage, startBackgroundDaemon, stopRunningDaemon } from './daemon-process.js';
 import { nerveHome, requestJson } from './local-http.js';
 import { notificationFromEvent } from './notification.js';
 import { pushTargetFromEnv } from './push-client.js';
@@ -19,10 +20,13 @@ function shellQuote(value: string) {
   return "'" + value.replaceAll("'", "'\\''") + "'";
 }
 
+function nerveArgs(...args: string[]) {
+  // 独立版直接传入子命令，源码版需要向 Node 传入脚本路径。
+  return isSea() ? args : [fileURLToPath(import.meta.url), ...args];
+}
+
 function codexHookCommand() {
-  // 独立版直接调用可执行文件，源码版使用 Node 和脚本的绝对路径。
-  const launcher = isSea() ? [process.execPath] : [process.execPath, fileURLToPath(import.meta.url)];
-  return [...launcher, 'codex-hook'].map(shellQuote).join(' ');
+  return [process.execPath, ...nerveArgs('codex-hook')].map(shellQuote).join(' ');
 }
 
 async function codexHook() {
@@ -72,14 +76,26 @@ async function attachEvent(hostId: string | undefined, eventId: string | undefin
 async function main([command, arg, limit]: string[]) {
   switch (command) {
     case 'start': {
+      if (arg === undefined) {
+        await startBackgroundDaemon(nerveArgs('start', '--foreground'));
+        break;
+      }
+      if (arg !== '--foreground' || limit !== undefined) throw new Error('用法为 nerve start [--foreground]');
       const { startDaemon } = await import('./server.js');
       const { server, socketPath } = await startDaemon(nerveHome(), pushTargetFromEnv(process.env));
       const stop = () => server.close();
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
+      process.once('SIGHUP', stop);
       console.error('[Nerve] 正在监听 ' + socketPath);
+      // Unix Socket 就绪后应答启动命令。启动终端提前退出时仍可提供服务。
+      if (process.connected) process.send?.(daemonReadyMessage, () => {});
       break;
     }
+    case 'stop':
+      if (arg !== undefined) throw new Error('用法为 nerve stop');
+      await stopRunningDaemon();
+      break;
     case 'health':
       printJson(await requestJson('/v1/health'));
       break;
@@ -119,7 +135,7 @@ async function main([command, arg, limit]: string[]) {
       break;
     case undefined:
     case '--help':
-      console.log('nerve start | health | push-status | events [after] [limit] | sessions | panes <session> | codex-config'
+      console.log('nerve start [--foreground] | stop | health | push-status | events [after] [limit] | sessions | panes <session> | codex-config'
         + ' | attach-event <host-id> <event-id>' + (isSea() ? ' | setup-agents | omp-extension' : ''));
       break;
     default:

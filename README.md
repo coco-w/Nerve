@@ -94,27 +94,60 @@ node entry/src/main/mosh/test/roaming.cjs
 
 ### 下载现成安装包
 
-从 GitHub Releases 下载与开发机匹配的 `.tar.gz`。可用同一 Release 的 `SHA256SUMS` 核对文件。Linux 安装包适用于使用 glibc 的发行版，例如 Ubuntu、Debian 和对应的 WSL 环境。 [GitHub Releases](https://github.com/coco-w/Nerve/releases)
-
-| 开发机 | 安装包文件名后缀 |
-| --- | --- |
-| Linux／WSL · x86-64 | `linux-x64.tar.gz` |
-| Linux／WSL · ARM64 | `linux-arm64.tar.gz` |
-| Mac · Apple 芯片 | `macos-arm64.tar.gz` |
-| Mac · Intel | `macos-x64.tar.gz` |
-
-以 Linux／WSL x64 的 0.2.0 版为例，解压后运行安装脚本。
+在 Linux、WSL 或 macOS 的终端复制整段命令。它会识别系统和 x64／ARM64 架构，从 GitHub 下载对应安装包，校验 SHA-256 后安装。安装其他版本时修改第一行。Linux 包适用于使用 glibc 的发行版，例如 Ubuntu 和 Debian。 [GitHub Releases](https://github.com/coco-w/Nerve/releases)
 
 ~~~bash
-tar -xzf nerve-daemon-v0.2.0-linux-x64.tar.gz
-cd nerve-daemon-v0.2.0-linux-x64
-./install.sh
-"$HOME/.local/bin/nerve" start
+nerve_version=0.3.0
+(
+  set -eu
+  case "$(uname -s)" in
+    Linux) nerve_os=linux ;;
+    Darwin) nerve_os=macos ;;
+    *) printf '%s\n' '请在 Linux、WSL 或 macOS 中安装 Nerve Daemon。' >&2; exit 1 ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64) nerve_arch=x64 ;;
+    aarch64|arm64) nerve_arch=arm64 ;;
+    *) printf '%s\n' 'Nerve Daemon 提供 x64 和 ARM64 安装包。' >&2; exit 1 ;;
+  esac
+
+  nerve_tag="daemon-v$nerve_version"
+  nerve_name="nerve-daemon-v$nerve_version-$nerve_os-$nerve_arch"
+  nerve_archive="$nerve_name.tar.gz"
+  nerve_download="https://github.com/coco-w/Nerve/releases/download/$nerve_tag"
+  nerve_tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/nerve-install.XXXXXXXX")
+  trap 'rm -rf -- "$nerve_tmpdir"' EXIT
+
+  (
+    cd "$nerve_tmpdir"
+    curl -fsSL --retry 3 -o "$nerve_archive" "$nerve_download/$nerve_archive"
+    curl -fsSL --retry 3 -o SHA256SUMS "$nerve_download/SHA256SUMS"
+    awk -v archive="$nerve_archive" '$2 == archive { print; found++ } END { exit found != 1 }' SHA256SUMS > SHA256SUM
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum -c SHA256SUM
+    else
+      shasum -a 256 -c SHA256SUM
+    fi
+    tar -xzf "$nerve_archive"
+  )
+  "$nerve_tmpdir/$nerve_name/install.sh"
+)
 ~~~
 
-安装脚本默认把 `nerve` 放到 `~/.local/bin`。可以用 `NERVE_INSTALL_DIR` 指定命令目录。另开终端运行 `"$HOME/.local/bin/nerve" health` 检查状态和主机 ID。
+安装脚本默认把 `nerve` 放到 `~/.local/bin`。可以用 `NERVE_INSTALL_DIR` 指定命令目录。
 
 `./install.sh` 会探测 `PATH` 中的 `codex` 和 `omp`，合并 Codex Hook 并安装 OMP 扩展。之后才安装 Agent，或切换了 Agent 的配置目录时，可用 `"$HOME/.local/bin/nerve" setup-agents` 补配。重复运行沿用已有的相同配置。只安装 Daemon 可用 `./install.sh --no-agents`。
+
+### 启动和停止
+
+`nerve start` 在后台启动 Daemon 并等到服务就绪。启动窗口关闭后进程会继续运行。重复启动会复用同一实例。下面的命令使用默认安装路径。
+
+~~~bash
+"$HOME/.local/bin/nerve" start
+"$HOME/.local/bin/nerve" health
+~~~
+
+用 `"$HOME/.local/bin/nerve" stop` 停止 Daemon。需要在终端查看启动日志时使用 `nerve start --foreground`。后台日志默认保存在 `~/.nerve/daemon.log`。更改 Gateway 配置后，先停止旧进程，再从带有新配置的终端启动。开发机或 WSL 重启后可重新运行 `nerve start`。
 
 启动 Daemon 后，从需要关联的 Zellij 窗格重新打开 Agent。Codex 初次提示时在 `/hooks` 里信任 Nerve Hook，OMP 启动时自动加载。运行 `"$HOME/.local/bin/nerve" events` 可查询收到的事件。
 
@@ -140,7 +173,7 @@ node dist/cli.js events        # 从游标 0 读取前 50 条
 node dist/cli.js events 0 10   # 从游标 0 读取前 10 条
 ~~~
 
-`NERVE_HOME` 默认为 `~/.nerve`，内含 `nerve.sock` 和 `events.sqlite`。如需自定义，在 Daemon 和 Agent 启动前设置同一个绝对路径。目录须支持 Unix Socket 并由当前用户独占访问（`0700`）。在 WSL 中使用发行版内的 Linux 文件系统。正常停止时 Socket 会被清理。若强制终止后重启遇到 `EADDRINUSE`，确认没有 Daemon 监听后再删除残留的 `nerve.sock`。
+`NERVE_HOME` 默认为 `~/.nerve`，内含 `nerve.sock`、`events.sqlite` 和后台日志 `daemon.log`。如需自定义，在 Daemon 和 Agent 启动前设置同一个绝对路径。目录须支持 Unix Socket 并由当前用户独占访问（`0700`）。在 WSL 中使用发行版内的 Linux 文件系统。正常停止时 Socket 会被清理。若强制终止后重启遇到 `EADDRINUSE`，确认没有 Daemon 监听后再删除残留的 `nerve.sock`。
 
 要让手机点击通知后直接打开会话，需要让 SSH 登录运行 `nerve`。 [配置通知会话入口](#从通知打开-zellij-会话)
 
@@ -268,12 +301,12 @@ Gateway 开始投递其目录中待发送的通知。锁屏正文使用固定模
 
 ## 发布 Daemon
 
-将 `daemon/package.json` 和锁文件的版本更新后提交，例如在 `daemon/` 运行 `npm version 0.2.0 --no-git-tag-version`。推送与该版本一致的 `daemon-vX.Y.Z` 标签会自动运行测试、打包四个平台并发布带校验文件的 GitHub Release。以下命令以 0.2.0 为例。
+将 `daemon/package.json`、锁文件和安装命令顶部的版本更新后提交，例如在 `daemon/` 运行 `npm version 0.3.0 --no-git-tag-version`。推送与该版本一致的 `daemon-vX.Y.Z` 标签会自动运行测试、打包四个平台并发布带校验文件的 GitHub Release。以下命令以 0.3.0 为例。
 
 ~~~bash
 git push origin main
-git tag -a daemon-v0.2.0 -m "🚀 发布 Nerve Daemon 0.2.0"
-git push origin daemon-v0.2.0
+git tag -a daemon-v0.3.0 -m "🚀 发布 Nerve Daemon 0.3.0"
+git push origin daemon-v0.3.0
 ~~~
 
 可在 GitHub Actions 手动运行「Nerve Daemon 打包发布」取得测试安装包。开发者也可以用带许可证文件的 Node.js 26 官方发行包，在 `daemon/` 执行 `npm ci` 和 `npm run package`，产物位于 `daemon/release/`。macOS 安装包使用临时签名。 [发布工作流](.github/workflows/daemon-release.yml) · [Node.js 独立可执行文件](https://nodejs.org/api/single-executable-applications.html)

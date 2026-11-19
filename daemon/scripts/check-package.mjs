@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import { setTimeout as wait } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 
 const archive = resolve(process.argv[2]);
 // 保持 Socket 路径简短，兼容 macOS 的 Unix Socket 路径长度。
@@ -19,11 +19,9 @@ delete env.NERVE_GATEWAY_URL;
 delete env.NERVE_GATEWAY_TOKEN;
 delete env.NODE_OPTIONS;
 const nerve = join(installDir, 'nerve');
-const run = (...args) => execFileSync(nerve, args, {
-  cwd: workspace, env, encoding: 'utf8', timeout: 3000, stdio: 'pipe',
-});
-let daemon;
-let closed;
+const runOptions = { cwd: workspace, env, encoding: 'utf8', timeout: 12000, stdio: 'pipe' };
+const run = (...args) => execFileSync(nerve, args, runOptions);
+const runAsync = promisify(execFile);
 
 try {
   execFileSync('tar', ['-xzf', archive, '-C', workspace]);
@@ -83,21 +81,12 @@ try {
 
   // 安装目录外运行，PATH 中没有 Node.js 或 npm。
   assert.match(run('--help'), /nerve start/);
-  daemon = spawn(nerve, ['start'], { cwd: workspace, env, stdio: ['ignore', 'ignore', 'pipe'] });
-  closed = new Promise(resolveClose => daemon.once('close', resolveClose));
-  let startupError = '';
-  daemon.stderr.setEncoding('utf8').on('data', message => { startupError += message; });
-  daemon.on('error', error => { startupError += String(error); });
-  let ready = false;
-  const deadline = Date.now() + 5000;
-  while (!ready && Date.now() < deadline && daemon.exitCode === null) {
-    try {
-      ready = JSON.parse(run('health')).status === 'ok';
-    } catch {
-      await wait(100);
-    }
-  }
-  assert.ok(ready, '独立版 Daemon 启动失败\n' + startupError);
+  const launches = await Promise.all([runAsync(nerve, ['start'], runOptions), runAsync(nerve, ['start'], runOptions)]);
+  assert.equal(launches.filter(launch => launch.stdout.includes('正在后台运行')).length, 1);
+  assert.match(run('start'), /已在运行/);
+  const health = JSON.parse(run('health'));
+  assert.equal(health.status, 'ok');
+  assert.match(await readFile(join(instance, 'daemon.log'), 'utf8'), /正在监听/);
 
   // 执行已自动注册的 Hook，确认命令引用已安装的 nerve，且空格路径可用。
   const hook = loaded.hooks.Stop[1].hooks[0].command;
@@ -119,9 +108,22 @@ try {
   });
   const { events } = JSON.parse(run('events'));
   assert.deepEqual(events.map(event => event.agent), ['codex', 'omp']);
-  console.log('安装包已通过 Agent 自动接入、独立启动和 SQLite 事件入库测试');
+
+  // 停止后可马上重启，后台进程继承新配置，原有事件和主机 ID 随数据库保留。
+  assert.match(run('stop'), /已停止/);
+  assert.equal(spawnSync(nerve, ['health'], runOptions).status, 1);
+  assert.match(run('stop'), /未运行/);
+  const pushEnv = {
+    ...env,
+    NERVE_GATEWAY_URL: 'http://127.0.0.1:1/v1/notifications',
+    NERVE_GATEWAY_TOKEN: 'a'.repeat(32),
+  };
+  assert.match(execFileSync(nerve, ['start'], { ...runOptions, env: pushEnv }), /正在后台运行/);
+  assert.equal(JSON.parse(run('health')).hostId, health.hostId);
+  assert.equal(JSON.parse(run('push-status')).enabled, true);
+  assert.deepEqual(JSON.parse(run('events')).events, events);
+  console.log('安装包已通过 Agent 自动接入、后台启停和 SQLite 事件恢复测试');
 } finally {
-  daemon?.kill('SIGTERM');
-  await closed;
+  spawnSync(nerve, ['stop'], runOptions);
   await rm(workspace, { recursive: true, force: true });
 }

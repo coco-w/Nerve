@@ -20,12 +20,18 @@ function cursorParam(value: string | null, fallback: number, min: number, max: n
   return number;
 }
 
-async function route(request: IncomingMessage, response: ServerResponse, store: EventStore) {
+async function route(request: IncomingMessage, response: ServerResponse, store: EventStore, stop: () => void) {
   const url = new URL(request.url ?? '/', 'http://nerve.local');
   if (request.method === 'GET' && url.pathname === '/v1/health') {
     sendJson(response, 200, { status: 'ok', schemaVersion: 1, hostId: store.hostId });
   } else if (request.method === 'GET' && url.pathname === '/v1/push/status') {
     sendJson(response, 200, { enabled: store.pushEnabled, ...store.pushQueue.status() });
+  } else if (request.method === 'POST' && url.pathname === '/v1/shutdown') {
+    await readJson(request, 64, 'shutdown_request_too_large');
+    // 先停监听，再回复停止指令，便于客户端随后重新启动。
+    stop();
+    response.setHeader('connection', 'close');
+    sendJson(response, 200, { status: 'stopping' });
   } else if (request.method === 'GET' && url.pathname === '/v1/events') {
     const after = cursorParam(url.searchParams.get('after'), 0, 0, Number.MAX_SAFE_INTEGER);
     const limit = cursorParam(url.searchParams.get('limit'), 50, 1, 200);
@@ -53,7 +59,11 @@ export async function startDaemon(directory: string, pushTarget?: PushTarget) {
   ensurePrivateDirectory(directory, 'NERVE_HOME');
   const socketPath = join(directory, 'nerve.sock');
   const store = new EventStore(join(directory, 'events.sqlite'), pushTarget !== undefined);
-  const server = jsonServer('[Nerve]', (request, response) => route(request, response, store));
+  // 停止命令走同一个用户私有 Socket，无需根据 PID 猜测要停止的进程。
+  const server = jsonServer('[Nerve]', (request, response) => route(request, response, store, stopListening));
+  function stopListening() {
+    server.close();
+  }
   try {
     server.listen(socketPath);
     await once(server, 'listening');
