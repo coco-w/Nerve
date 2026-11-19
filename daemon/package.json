@@ -11,12 +11,14 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "package": "npm run build && node scripts/package.mjs",
     "start": "node dist/cli.js start",
     "gateway": "node dist/gateway/cli.js",
     "test": "npm run build && node --test"
   },
   "devDependencies": {
     "@types/node": "24.19.2",
+    "esbuild": "0.28.2",
     "typescript": "5.9.3"
   }
 }

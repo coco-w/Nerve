@@ -86,13 +86,37 @@ node entry/src/main/mosh/test/roaming.cjs
 
 | 用途 | 开发机需要准备 |
 | --- | --- |
-| 安装并运行 Daemon | Node.js 24.14.0 或更高版本、npm 和本仓库源码。SQLite 由 Node.js 提供。 [Node.js 下载](https://nodejs.org/en/download) |
+| 安装并运行 Daemon | 安装包内置 Node.js 与 SQLite。源码安装需要 Node.js 24.14.0 或更高版本和 npm。 [Node.js 下载](https://nodejs.org/en/download) |
 | 保留和附接开发会话 | Zellij，当前联调版本为 0.46.0，确保登录账号可以执行 `zellij`。 [Zellij 安装说明](https://zellij.dev/documentation/installation) |
 | 采集开发事件 | 安装并配置实际使用的 Codex CLI 或 Oh My Pi，再启用下方对应的 Hook 或扩展。 |
 | 手机连接 | 启用 SSH 服务，让手机能访问开发机的 SSH 端口。使用 Mosh 时再安装 `mosh-server` 并提供可达的 UDP 端口。 [SSH 连接](#手机连接-ssh) · [Mosh 连接](#手机连接-mosh) |
 | 手机收推送 | 使用已有 Push Gateway 时，在启动 Daemon 前设置 `NERVE_GATEWAY_URL` 和对应的 `NERVE_GATEWAY_TOKEN`。 [共用网关配置](#多台开发机共用一个-gateway) |
 
-把仓库放在开发机上，从仓库根目录执行以下命令。
+### 下载现成安装包
+
+从 GitHub Releases 下载与开发机匹配的 `.tar.gz`。可用同一 Release 的 `SHA256SUMS` 核对文件。Linux 安装包适用于使用 glibc 的发行版，例如 Ubuntu、Debian 和对应的 WSL 环境。 [GitHub Releases](https://github.com/coco-w/Nerve/releases)
+
+| 开发机 | 安装包文件名后缀 |
+| --- | --- |
+| Linux／WSL · x86-64 | `linux-x64.tar.gz` |
+| Linux／WSL · ARM64 | `linux-arm64.tar.gz` |
+| Mac · Apple 芯片 | `macos-arm64.tar.gz` |
+| Mac · Intel | `macos-x64.tar.gz` |
+
+以 Linux／WSL x64 的 0.1.0 版为例，解压后运行安装脚本。
+
+~~~bash
+tar -xzf nerve-daemon-v0.1.0-linux-x64.tar.gz
+cd nerve-daemon-v0.1.0-linux-x64
+./install.sh
+"$HOME/.local/bin/nerve" start
+~~~
+
+安装脚本默认把 `nerve` 放到 `~/.local/bin`。可以用 `NERVE_INSTALL_DIR` 指定已有的命令目录。另开终端运行 `"$HOME/.local/bin/nerve" health` 检查状态和主机 ID。
+
+### 从源码安装
+
+把仓库源码放在开发机上，从仓库根目录执行以下命令。
 
 ~~~bash
 cd daemon
@@ -118,17 +142,31 @@ node dist/cli.js events 0 10   # 从游标 0 读取前 10 条
 
 ### Codex
 
-在仓库的 `daemon/` 目录生成 Hook 配置。
+使用安装包时，通过 `nerve` 生成 Hook 配置。
+
+~~~bash
+"$HOME/.local/bin/nerve" codex-config > /tmp/nerve-codex-hooks.json
+~~~
+
+使用源码版时，在仓库的 `daemon/` 目录执行以下命令。
 
 ~~~bash
 node dist/cli.js codex-config > /tmp/nerve-codex-hooks.json
 ~~~
 
-将输出中的 Hook 按事件合并到 `$CODEX_HOME/hooks.json`（默认 `~/.codex/hooks.json`）或受信任项目的 `.codex/hooks.json`。保留现有配置，从 Zellij 窗格启动 Codex，再用 `/hooks` 查看并信任新增的命令。生成的命令含 Node 和 Daemon 的绝对路径，移动目录后可重新生成。 [Codex Hooks 文档](https://developers.openai.com/codex/hooks)
+将输出中的 Hook 按事件合并到 `$CODEX_HOME/hooks.json`（默认 `~/.codex/hooks.json`）或受信任项目的 `.codex/hooks.json`。保留现有配置，从 Zellij 窗格启动 Codex，再用 `/hooks` 查看并信任新增的命令。生成的命令使用绝对路径，移动安装目录后请重新生成。 [Codex Hooks 文档](https://developers.openai.com/codex/hooks)
 
 ### OMP
 
-从希望关联的 Zellij 窗格启动，将扩展路径替换为本机的绝对路径。
+使用安装包时，可从 `nerve` 导出与当前版本对应的扩展。从希望关联的 Zellij 窗格启动 OMP。
+
+~~~bash
+mkdir -p "$HOME/.local/share/nerve"
+"$HOME/.local/bin/nerve" omp-extension > "$HOME/.local/share/nerve/omp-extension.mjs"
+omp -e "$HOME/.local/share/nerve/omp-extension.mjs"
+~~~
+
+使用源码版时，将扩展路径替换为本机的绝对路径。
 
 ~~~bash
 omp -e "/你的仓库路径/Nerve/daemon/adapters/omp/extension.ts"
@@ -228,11 +266,23 @@ Gateway 开始投递其目录中待发送的通知。锁屏正文使用固定模
 
 ### 从通知打开 Zellij 会话
 
-在触发通知的开发机上，用运行 Daemon 的同一个系统账号，在已构建的 `daemon/` 目录执行 `npm link`。让 SSH 的非交互命令能从 `PATH` 找到 `node` 和 `nerve`。若 Daemon 使用自定义 `NERVE_HOME`，让 SSH 的非交互命令也能读到该值。
+让开发机的 SSH 非交互命令能从 `PATH` 找到 `nerve`。使用安装包时，将安装目录加入该账号的 `PATH`。使用源码版时，在已构建的 `daemon/` 目录执行 `npm link`，并让 SSH 同时能找到 `node`。若 Daemon 使用自定义 `NERVE_HOME`，让 SSH 的非交互命令也能读到该值。
 
 用已保存的配置连接一次开发机。Nerve 通过已验证的 SSH 连接执行 `nerve health`，把 Daemon 主机 ID 保存在该服务器记录中。如果更换主机、端口或用户名，再连接时会重新绑定。
 
 点击通知后，匹配到唯一的服务器时，点「打开会话」就会用保存的连接方式和凭据登录。尚无匹配或存在多个登录方式时，可手动选对应服务器，也可填写该主机的 SSH 凭据后点「连接并打开会话」。Nerve 校验 SSH 指纹和 Daemon 主机 ID，再按事件 ID 附接原来的 Zellij 会话。会话已关闭或改名时，终端会显示原因。
+
+## 发布 Daemon
+
+将 `daemon/package.json` 和锁文件的版本更新后提交，例如在 `daemon/` 运行 `npm version 0.1.1 --no-git-tag-version`。推送与该版本一致的 `daemon-vX.Y.Z` 标签会自动运行测试、打包四个平台并发布带校验文件的 GitHub Release。以下命令以首个版本 0.1.0 为例。
+
+~~~bash
+git push origin main
+git tag -a daemon-v0.1.0 -m "🚀 发布 Nerve Daemon 0.1.0"
+git push origin daemon-v0.1.0
+~~~
+
+可在 GitHub Actions 手动运行「Nerve Daemon 打包发布」取得测试安装包。开发者也可以用带许可证文件的 Node.js 26 官方发行包，在 `daemon/` 执行 `npm ci` 和 `npm run package`，产物位于 `daemon/release/`。macOS 安装包使用临时签名。 [发布工作流](.github/workflows/daemon-release.yml) · [Node.js 独立可执行文件](https://nodejs.org/api/single-executable-applications.html)
 
 ## 验收
 

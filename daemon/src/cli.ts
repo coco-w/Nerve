@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { getAsset, isSea } from 'node:sea';
 import { fileURLToPath } from 'node:url';
 import { codexEvents, fromCodexHook, isRecord, parseAgentEvent, uuidPattern } from './agent.js';
 import { nerveHome, requestJson } from './local-http.js';
@@ -18,8 +19,9 @@ function shellQuote(value: string) {
 }
 
 function codexHookConfig() {
-  // 使用构建时命令所在的绝对路径，避免 Agent 工作目录改变后找不到脚本。
-  const command = [process.execPath, fileURLToPath(import.meta.url), 'codex-hook'].map(shellQuote).join(' ');
+  // 独立版直接调用可执行文件，源码版使用 Node 和脚本的绝对路径。
+  const launcher = isSea() ? [process.execPath] : [process.execPath, fileURLToPath(import.meta.url)];
+  const command = [...launcher, 'codex-hook'].map(shellQuote).join(' ');
   return {
     hooks: Object.fromEntries(Object.keys(codexEvents).map(event => [
       event, [{ hooks: [{ type: 'command', command, timeout: 3 }] }],
@@ -109,10 +111,15 @@ async function main([command, arg, limit]: string[]) {
     case 'codex-hook':
       await codexHook();
       break;
+    case 'omp-extension':
+      // 导出与当前可执行文件同版本的独立 OMP 扩展。
+      if (!isSea()) throw new Error('源码版扩展位于 daemon/adapters/omp/extension.ts');
+      process.stdout.write(getAsset('omp-extension.mjs', 'utf8'));
+      break;
     case undefined:
     case '--help':
       console.log('nerve start | health | push-status | events [after] [limit] | sessions | panes <session> | codex-config'
-        + ' | attach-event <host-id> <event-id>');
+        + ' | attach-event <host-id> <event-id>' + (isSea() ? ' | omp-extension' : ''));
       break;
     default:
       throw new Error('未知命令，请运行 nerve --help');

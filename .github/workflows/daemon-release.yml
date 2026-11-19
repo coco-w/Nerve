@@ -1,0 +1,110 @@
+name: Nerve Daemon 打包发布
+
+on:
+  push:
+    tags:
+      - 'daemon-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daemon-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 打包 ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: macos-arm64
+            runner: macos-15
+          - target: macos-x64
+            runner: macos-15-intel
+    defaults:
+      run:
+        working-directory: daemon
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.13.1'
+          cache: npm
+          cache-dependency-path: daemon/package-lock.json
+      - name: 核对发布版本
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_REF_NAME" != "daemon-v$version" ]]; then
+            echo "发布标签应与 daemon/package.json 的版本一致"
+            exit 1
+          fi
+      - name: 运行测试并打包
+        run: |
+          npm ci
+          npm test
+          npm run package
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nerve-daemon-${{ matrix.target }}
+          path: daemon/release/nerve-daemon-v*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: 发布 GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: nerve-daemon-*
+          path: release
+          merge-multiple: true
+      - name: 生成校验文件并发布
+        working-directory: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          version="${tag#daemon-v}"
+          packages=()
+          for target in linux-x64 linux-arm64 macos-arm64 macos-x64; do
+            package="nerve-daemon-v$version-$target.tar.gz"
+            test -s "$package"
+            packages+=("$package")
+          done
+          sha256sum "${packages[@]}" > SHA256SUMS
+
+          # 先上传到草稿，全部完成后公开。重试时续传同一标签的草稿。
+          draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          if [[ "$draft" == false ]]; then
+            existing=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            for asset in "${packages[@]}" SHA256SUMS; do
+              grep -Fxq "$asset" <<< "$existing"
+            done
+            exit 0
+          fi
+          if [[ "$draft" != true ]]; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --title "Nerve Daemon v$version" --generate-notes
+          fi
+          gh release upload "$tag" "${packages[@]}" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
