@@ -117,6 +117,7 @@ struct Index {
   @State @Watch('updateNotificationMatch') private savedServers: SavedSshServer[] = [];
   @State private notificationServer: SavedSshServer | undefined = undefined;
   @State private editingServer: SavedSshServer | undefined = undefined;
+  // 首页始终是主机列表，新增和编辑操作才打开表单。
   @State private serverEditorOpen: boolean = false;
   @State private managingServers: boolean = false;
   @State private serverListUnavailable: boolean = false;
@@ -1119,15 +1120,31 @@ struct Index {
   @Builder
   savedServerList() {
     Row({ space: 8 }) {
-      Text('已保存的服务器').layoutWeight(1).fontFamily(APP_FONT).fontSize(16).fontColor(FOREGROUND)
+      Text('主机列表').layoutWeight(1).fontFamily(APP_FONT).fontSize(20)
+        .fontWeight(FontWeight.Medium).fontColor(FOREGROUND)
       Button('添加服务器', { type: ButtonType.Normal })
         .height(40).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
-        .fontColor(FOREGROUND).backgroundColor(SURFACE)
+        .fontColor(BACKGROUND).backgroundColor(ACCENT)
         .onClick(() => this.setServerEditor(true))
     }.width('100%')
     this.connectionError()
     if (this.checkingHostKey) {
       Text('正在核对主机').fontFamily(APP_FONT).fontColor(MUTED).fontSize(14)
+    }
+    if (this.serverListUnavailable) {
+      Row({ space: 8 }) {
+        Text('暂时无法读取已保存的服务器').layoutWeight(1)
+          .fontFamily(APP_FONT).fontColor(ERROR).fontSize(13)
+        Button('重试', { type: ButtonType.Normal })
+          .height(36).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
+          .fontColor(FOREGROUND).backgroundColor(SURFACE)
+          .onClick(() => this.loadSavedServers())
+      }.width('100%')
+    } else if (this.savedServers.length === 0) {
+      Text(this.managingServers ? '正在读取主机…' : '暂无已保存的服务器')
+        .width('100%').padding({ top: 28, bottom: 28 }).borderRadius(10)
+        .fontFamily(APP_FONT).fontSize(14).fontColor(MUTED).textAlign(TextAlign.Center)
+        .backgroundColor(SURFACE)
     }
     ForEach(this.savedServers, (server: SavedSshServer) => {
       this.savedServerRow(server)
@@ -1148,10 +1165,8 @@ struct Index {
           (value: string) => { this.port = value; })
       }.layoutWeight(1)
     }.width('100%')
-    if (this.serverEditorOpen || !this.pushLink) {
-      this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
-        (value: string) => { this.zellijSession = value; })
-    }
+    this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
+      (value: string) => { this.zellijSession = value; })
     Row({ space: 8 }) {
       this.optionButton('SSH', !this.useMosh, () => { this.useMosh = false; })
       this.optionButton('Mosh', this.useMosh, () => { this.useMosh = true; })
@@ -1211,6 +1226,10 @@ struct Index {
             Text(this.notificationServer.username + '@' +
               this.knownHostId(this.notificationServer.host, this.notificationServer.port))
               .fontFamily(APP_FONT).fontSize(13).fontColor(MUTED).wordBreak(WordBreak.BREAK_ALL)
+          } else if (this.serverEditorOpen && !this.editingServer) {
+            Text('填写发送通知的开发机信息后连接').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
+          } else if (this.savedServers.length === 0) {
+            Text('点「添加服务器」填写开发机信息').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
           } else {
             Text('选择发送通知的开发机').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
           }
@@ -1230,24 +1249,16 @@ struct Index {
   }
 
   @Builder
-  connectionForm() {
+  serversPage() {
     Scroll() {
       Column({ space: 14 }) {
         Row({ space: 12 }) {
-          Text('>_')
-            .fontSize(18)
-            .fontFamily(APP_FONT)
-            .fontColor(ACCENT)
-            .textAlign(TextAlign.Center)
-            .width(44)
-            .height(42)
-            .backgroundColor(SURFACE)
-            .borderRadius(10)
-          Column({ space: 2 }) {
-            Text('Nerve').fontFamily(APP_FONT).fontSize(25).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
-            Text(this.serverEditorOpen ? this.editingServer ? '编辑服务器' : '添加服务器' : '远程连接')
-              .fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
-          }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+          if (!this.serverEditorOpen) {
+            Text('>_').width(44).height(42).borderRadius(10).backgroundColor(SURFACE)
+              .fontSize(18).fontFamily(APP_FONT).fontColor(ACCENT).textAlign(TextAlign.Center)
+          }
+          Text(this.serverEditorOpen ? (this.editingServer ? '编辑服务器' : '添加服务器') : 'Nerve')
+            .layoutWeight(1).fontFamily(APP_FONT).fontSize(25).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
           Button(this.serverEditorOpen ? '返回' : '推送通知', { type: ButtonType.Normal })
             .fontFamily(APP_FONT).fontSize(13).fontColor(FOREGROUND).backgroundColor(SURFACE)
             .borderRadius(8).height(36)
@@ -1262,20 +1273,10 @@ struct Index {
         if (this.pushLink) {
           this.notificationCard()
         }
-        if (this.serverListUnavailable) {
-          Row({ space: 8 }) {
-            Text('暂时无法读取已保存的服务器').layoutWeight(1)
-              .fontFamily(APP_FONT).fontColor(ERROR).fontSize(13)
-            Button('重试', { type: ButtonType.Normal })
-              .height(36).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
-              .fontColor(FOREGROUND).backgroundColor(SURFACE)
-              .onClick(() => this.loadSavedServers())
-          }.width('100%')
-        }
-        if (this.savedServers.length && !this.serverEditorOpen) {
-          this.savedServerList()
-        } else {
+        if (this.serverEditorOpen) {
           this.serverFields()
+        } else {
+          this.savedServerList()
         }
       }
       .padding({ left: 20, top: 18, right: 20, bottom: 28 })
@@ -1431,7 +1432,7 @@ struct Index {
       } else if (this.pushSettingsVisible) {
         PushSettings({ onClose: () => { this.pushSettingsVisible = false; } })
       } else {
-        this.connectionForm()
+        this.serversPage()
       }
     }
     .width('100%')
