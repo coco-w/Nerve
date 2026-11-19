@@ -5,7 +5,9 @@ import { startPushGateway } from './server.js';
 
 async function main() {
   // Gateway 有自己的监听端口和 SQLite 目录，可独立于 Daemon 部署。
-  const { NERVE_GATEWAY_HOME, NERVE_GATEWAY_PORT = '8787', NERVE_GATEWAY_TOKEN = '' } = process.env;
+  // 公网 HTTP 网关用 NERVE_GATEWAY_BIND=0.0.0.0，对通知入口强制使用签名。
+  const { NERVE_GATEWAY_HOME, NERVE_GATEWAY_BIND = '127.0.0.1', NERVE_GATEWAY_PORT = '8787',
+    NERVE_GATEWAY_TOKEN = '' } = process.env;
   const port = Number(NERVE_GATEWAY_PORT);
   if (!/^\d+$/.test(NERVE_GATEWAY_PORT) || !Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error('NERVE_GATEWAY_PORT 应为 1–65535 的端口号');
@@ -16,13 +18,14 @@ async function main() {
     directory,
     port,
     token: NERVE_GATEWAY_TOKEN,
+    bind: NERVE_GATEWAY_BIND,
     deliver: huawei ? deliverToHuawei(huawei) : undefined,
   });
   const stop = () => server.close();
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   const mode = huawei ? 'Huawei Push Kit' : '本地收件';
-  console.error('[Nerve Push Gateway] 正在监听 127.0.0.1:' + port + ' · ' + mode);
+  console.error('[Nerve Push Gateway] 正在监听 ' + NERVE_GATEWAY_BIND + ':' + port + ' · ' + mode);
 }
 
 main().catch(error => {

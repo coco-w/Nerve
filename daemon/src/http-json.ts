@@ -12,7 +12,12 @@ export function sendJson(response: ServerResponse, status: number, body: unknown
   response.end(JSON.stringify(body));
 }
 
-export async function readJson(request: IncomingMessage, limit: number, tooLarge: string): Promise<unknown> {
+export async function readJson(
+  request: IncomingMessage,
+  limit: number,
+  tooLarge: string,
+  verifyBody?: (body: Buffer) => void,
+): Promise<unknown> {
   if (request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') {
     throw new RequestError(415, 'expected_application_json');
   }
@@ -23,8 +28,10 @@ export async function readJson(request: IncomingMessage, limit: number, tooLarge
     if (length > limit) throw new RequestError(413, tooLarge);
     buffers.push(chunk);
   }
+  const body = Buffer.concat(buffers);
+  verifyBody?.(body);
   try {
-    return JSON.parse(Buffer.concat(buffers).toString('utf8'));
+    return JSON.parse(body.toString('utf8'));
   } catch {
     throw new RequestError(400, 'invalid_json');
   }

@@ -105,7 +105,9 @@ omp -e /mnt/d/Huawei/Nerve/daemon/adapters/omp/extension.ts
 | 每台需要发通知的开发机 | `NERVE_GATEWAY_URL` 指向同一个网关的 `/v1/notifications`，`NERVE_GATEWAY_TOKEN` 用于向网关鉴权 |
 | Push Gateway 所在机器 | 设置相同的 `NERVE_GATEWAY_TOKEN`，并在这一台配置华为服务账号 JSON 和手机的 Push Token |
 
-Gateway 默认监听 `127.0.0.1:8787`。跨机器使用时，在网关所在机器用 HTTPS 反向代理提供 `POST /v1/notifications`。开发机可经内网或 VPN 访问时，可使用该网络内的 HTTPS 地址。分散在不同网络且无法经私网访问时，可使用公网 HTTPS 地址。当前网关的通知统一投递到配置的一个手机 Push Token。
+Gateway 默认监听 `127.0.0.1:8787`。跨机器使用时，可以用 HTTPS 反向代理提供 `POST /v1/notifications`，也可以在仅提供 HTTP 的机器上用 `NERVE_GATEWAY_BIND=0.0.0.0` 监听指定的 TCP 端口。当前网关的通知统一投递到配置的一个手机 Push Token。
+
+远程 HTTP 的 `NERVE_GATEWAY_URL` 使用 `http://<网关地址>:8787/v1/notifications`。Daemon 与 Gateway 都需要更新到支持签名的版本，并使用同一个随机 `NERVE_GATEWAY_TOKEN`。公网监听模式要求通知请求携带 HMAC-SHA256 签名，入库回执同样有签名。服务端接受五分钟内的签名，并按主机 ID 和事件 ID 去重。HTTP 上的事件元数据以明文传输。
 
 在手机上添加 SSH 服务器时，只需要填写 SSH 连接信息。点推送通知时，手机仍通过 SSH 直连触发通知的开发机。
 

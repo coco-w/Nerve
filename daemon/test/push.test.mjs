@@ -6,20 +6,72 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { createAgentEvent } from '../dist/agent.js';
+import { receiptHeader, signNotification, signReceipt } from '../dist/gateway-auth.js';
 import { deliverToHuawei, huaweiConfigFromEnv } from '../dist/gateway/huawei.js';
+import { startPushGateway } from '../dist/gateway/server.js';
 import { notificationFromEvent } from '../dist/notification.js';
-import { pushTargetFromEnv } from '../dist/push-client.js';
+import { deliverToGateway, pushTargetFromEnv } from '../dist/push-client.js';
 import { PushQueue } from '../dist/push-queue.js';
 import { EventStore } from '../dist/store.js';
 
-test('远程 Gateway 地址要求 HTTPS，本机联调可使用 HTTP', () => {
+test('Gateway 通知地址支持远程 HTTP、HTTPS 与本机联调', () => {
   assert.equal(pushTargetFromEnv({}), undefined);
   const env = { NERVE_GATEWAY_TOKEN: 'test-token-' + randomUUID() };
   assert.throws(() => pushTargetFromEnv(env), /同时设置/);
-  assert.throws(() => pushTargetFromEnv({ ...env, NERVE_GATEWAY_URL: 'http://gateway.example/v1/notifications' }),
-    /HTTPS/);
-  const url = 'http://127.0.0.1:8787/v1/notifications';
-  assert.equal(pushTargetFromEnv({ ...env, NERVE_GATEWAY_URL: url }).url.href, url);
+  for (const url of ['http://gateway.example/v1/notifications', 'https://gateway.example/v1/notifications',
+    'http://127.0.0.1:8787/v1/notifications']) {
+    assert.equal(pushTargetFromEnv({ ...env, NERVE_GATEWAY_URL: url }).url.href, url);
+  }
+  assert.throws(() => pushTargetFromEnv({ ...env, NERVE_GATEWAY_URL: 'ftp://gateway.example/v1/notifications' }),
+    /HTTP 或 HTTPS/);
+});
+
+test('公网 HTTP 通知验证签名、有效期和入库回执，重发仍然去重', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nerve-signed-http-'));
+  const token = 'test-token-' + randomUUID();
+  const gateway = await startPushGateway({ directory: root, bind: '0.0.0.0', port: 0, token });
+  t.after(async () => {
+    await new Promise(resolve => gateway.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+  const local = new URL('http://127.0.0.1:' + gateway.address().port + '/v1/notifications');
+  const target = { url: new URL('http://gateway.example/v1/notifications'), token };
+  const event = createAgentEvent('codex', 'Stop', 'test-session', '/tmp', undefined, {});
+  const notification = notificationFromEvent(randomUUID(), event);
+  const body = JSON.stringify(notification);
+  const signal = AbortSignal.timeout(5000);
+  const post = (authorization, payload = body) => fetch(local, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization }, body: payload, signal,
+  });
+  const current = signNotification(token, body);
+  for (const request of [post('Bearer ' + token), post(signNotification(token, body, Date.now() - 360_000)),
+    post(current, body + ' ')]) {
+    const response = await request;
+    assert.equal(response.status, 401);
+    await response.body.cancel();
+  }
+
+  let accepted = 0;
+  const deliver = deliverToGateway(target, async (_url, request) => {
+    const authorization = request.headers.authorization;
+    assert.match(authorization, /^Nerve-HMAC [0-9]+\.[A-Za-z0-9_-]{43}$/);
+    assert.ok(!authorization.includes(token));
+    const response = await fetch(local, request);
+    assert.equal(response.status, accepted++ === 0 ? 202 : 200);
+    assert.equal(response.headers.get(receiptHeader), signReceipt(token, authorization, response.status));
+    return response;
+  });
+  assert.deepEqual(await deliver(notification, signal), { state: 'sent' });
+  assert.deepEqual(await deliver(notification, signal), { state: 'sent' });
+  const status = await fetch(new URL('/v1/status', local), {
+    headers: { authorization: 'Bearer ' + token }, signal,
+  });
+  assert.equal((await status.json()).pending, 1);
+
+  const forged = deliverToGateway(target, async () => Response.json({ accepted: true }, { status: 202 }));
+  assert.deepEqual(await forged(notification, signal), { state: 'retry', code: 'invalid_gateway_receipt' });
+  const forgedRejection = deliverToGateway(target, async () => new Response(null, { status: 422 }));
+  assert.deepEqual(await forgedRejection(notification, signal), { state: 'retry', code: 'gateway_http_422' });
 });
 
 test('事件和待发送记录在同一 SQLite 事务中回滚', async t => {
