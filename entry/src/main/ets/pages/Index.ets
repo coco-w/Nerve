@@ -127,6 +127,7 @@ struct Index {
   @State private serverEditorOpen: boolean = false;
   @State private managingServers: boolean = false;
   @State private serverListUnavailable: boolean = false;
+  @State private serverAlias: string = '';
   @State private host: string = '';
   @State private port: string = '22';
   @State private username: string = '';
@@ -304,6 +305,7 @@ struct Index {
     this.clearCredentials();
     this.errorText = '';
     this.editingServer = server;
+    this.serverAlias = server?.alias ?? '';
     this.host = server?.host ?? '';
     this.port = server ? String(server.port) : '22';
     this.username = server?.username ?? '';
@@ -343,7 +345,11 @@ struct Index {
       this.errorText = 'Mosh UDP 端口应为 1–65535，留空使用开发机分配的端口。';
       return undefined;
     }
-    return { host, port, username, zellijSession, usePrivateKey: this.usePrivateKey, useMosh: this.useMosh, moshPort };
+    // 只输入空白字符等同于留空，连接身份仍使用实际主机与账号。
+    return {
+      alias: this.serverAlias.trim(), host, port, username, zellijSession,
+      usePrivateKey: this.usePrivateKey, useMosh: this.useMosh, moshPort
+    };
   }
 
   private formCredentials(): SshCredentials | undefined {
@@ -735,7 +741,7 @@ struct Index {
       }
       if (await this.savedServerStore().bindDaemonHost(server, daemonHostId)) {
         const updated: SavedSshServer = {
-          id: server.id, host: server.host, port: server.port, username: server.username,
+          id: server.id, alias: server.alias, host: server.host, port: server.port, username: server.username,
           zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId,
           useMosh: server.useMosh, moshPort: server.moshPort
         };
@@ -1105,7 +1111,7 @@ struct Index {
   savedServerRow(server: SavedSshServer) {
     Row({ space: 8 }) {
       Column({ space: 4 }) {
-        Text(this.knownHostId(server.host, server.port))
+        Text(server.alias || this.knownHostId(server.host, server.port))
           .fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         Text(server.username + (server.zellijSession ? ' · ' + server.zellijSession : '') +
@@ -1160,6 +1166,8 @@ struct Index {
 
   @Builder
   serverFields() {
+    this.field('名称（可选）', this.serverAlias, '例如 我的 WSL', InputType.Normal, 128,
+      (value: string) => { this.serverAlias = value; })
     this.field('主机地址', this.host, '例如 dev.example.local', InputType.Normal, 253,
       (value: string) => { this.host = value; })
     Row({ space: 10 }) {

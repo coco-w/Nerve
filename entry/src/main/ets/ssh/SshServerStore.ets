@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { relationalStore } from '@kit.ArkData';
 
 const TABLE = 'ssh_servers';
-const SERVER_COLUMNS = ['id', 'host', 'port', 'username', 'zellij_session', 'use_private_key', 'daemon_host_id',
+const SERVER_COLUMNS = ['id', 'alias', 'host', 'port', 'username', 'zellij_session', 'use_private_key', 'daemon_host_id',
   'use_mosh', 'mosh_port'];
 const CREDENTIAL_COLUMNS = ['password', 'private_key', 'passphrase'];
 // 由鸿蒙生成和保管加密数据库的密钥，数据库目录配置为不参与应用备份。
@@ -14,6 +14,8 @@ const STORE_CONFIG: relationalStore.StoreConfig = {
 };
 
 export interface SshServerSettings {
+  // 别名用于显示，空字符串使用主机地址和端口作为标题。
+  alias: string;
   host: string;
   port: number;
   username: string;
@@ -48,6 +50,7 @@ export class SshServerStore {
     const db = await relationalStore.getRdbStore(this.context, STORE_CONFIG);
     await db.executeSql(`CREATE TABLE IF NOT EXISTS ${TABLE} (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      alias TEXT NOT NULL DEFAULT '',
       host TEXT NOT NULL,
       port INTEGER NOT NULL,
       username TEXT NOT NULL,
@@ -80,6 +83,10 @@ export class SshServerStore {
     if (!names.has('mosh_port')) {
       await db.executeSql(`ALTER TABLE ${TABLE} ADD COLUMN mosh_port INTEGER NOT NULL DEFAULT 0`);
     }
+    if (!names.has('alias')) {
+      // 老记录继承空别名，第一次打开新版即可继续按地址显示。
+      await db.executeSql(`ALTER TABLE ${TABLE} ADD COLUMN alias TEXT NOT NULL DEFAULT ''`);
+    }
     return db;
   }
 
@@ -107,6 +114,7 @@ export class SshServerStore {
       while (rows.goToNextRow()) {
         servers.push({
           id: rows.getLong(rows.getColumnIndex('id')),
+          alias: rows.getString(rows.getColumnIndex('alias')),
           host: rows.getString(rows.getColumnIndex('host')),
           port: rows.getLong(rows.getColumnIndex('port')),
           username: rows.getString(rows.getColumnIndex('username')),
@@ -149,6 +157,7 @@ export class SshServerStore {
     previous?: SavedSshServer): Promise<SavedSshServer> {
     const db = await this.open();
     const values: relationalStore.ValuesBucket = {
+      alias: server.alias,
       host: server.host,
       port: server.port,
       username: server.username,
@@ -187,7 +196,7 @@ export class SshServerStore {
       savedId = previous.id;
     }
     return {
-      id: savedId, host: server.host, port: server.port, username: server.username,
+      id: savedId, alias: server.alias, host: server.host, port: server.port, username: server.username,
       zellijSession: server.zellijSession, usePrivateKey: server.usePrivateKey, daemonHostId,
       useMosh: server.useMosh, moshPort: server.moshPort
     };
