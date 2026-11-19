@@ -26,6 +26,7 @@ struct ConnectOptions {
     std::string passphrase;
     std::string zellijSession;
     PtySize size;
+    std::string pushLink;
 
     // 本地认证参数只用于建立连接，握手完成后清理原生侧副本。
     void ClearCredentials();

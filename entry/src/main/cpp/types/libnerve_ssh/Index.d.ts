@@ -10,6 +10,7 @@ export interface SshConnectOptions {
   privateKey: string;
   passphrase: string;
   zellijSession: string;
+  pushLink: string;
   columns: number;
   rows: number;
 }

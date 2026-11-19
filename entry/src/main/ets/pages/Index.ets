@@ -3,6 +3,8 @@ import { KeyboardAvoidMode } from '@kit.ArkUI';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { connect, disconnect, read, resize, SshConnectOptions, SshHandle, write } from 'libnerve_ssh.so';
+import { PushSettings } from '../push/PushSettings';
+import { ACCENT, APP_FONT, BACKGROUND, ERROR, FOREGROUND, MUTED, SURFACE } from '../ui/Theme';
 
 // ArkWeb 拦截时使用资源 URL，加载后可能显示为 RAWFILE 格式。
 const TERMINAL_URL = 'resource://rawfile/terminal/index.html';
@@ -12,14 +14,6 @@ const POLL_MS = 30;
 const MAX_CHUNK_BYTES = 16 * 1024;
 const MAX_QUEUED_BYTES = 64 * 1024;
 const MAX_KEY_BYTES = 32 * 1024;
-// ArkUI 与 ArkWeb 使用同一份内置的 Maple Mono 字体。
-const APP_FONT = 'Maple Mono';
-const BACKGROUND = '#10191e';
-const SURFACE = '#1c2b32';
-const FOREGROUND = '#e4f0f0';
-const MUTED = '#a1b5bd';
-const ACCENT = '#7ae0bb';
-const ERROR = '#ffb7a9';
 
 interface PtySize {
   columns: number;
@@ -61,6 +55,9 @@ class TerminalBridge {
 @Entry
 @Component
 struct Index {
+  @StorageProp('nervePushLink') @Watch('onPushLinkChanged') private pushLink: string = '';
+  @State private pushSettingsVisible: boolean = false;
+  @State private openedPushLink: string = '';
   @State private host: string = '';
   @State private port: string = '22';
   @State private username: string = '';
@@ -106,11 +103,19 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    if (this.pushSettingsVisible) {
+      this.pushSettingsVisible = false;
+      return true;
+    }
     if (!this.terminalVisible) {
       return false;
     }
     this.backToForm();
     return true;
+  }
+
+  private onPushLinkChanged(): void {
+    if (this.pushLink) this.pushSettingsVisible = false;
   }
 
   aboutToDisappear(): void {
@@ -186,7 +191,9 @@ struct Index {
     const username = this.username.trim();
     const port = Number(this.port);
     const fingerprint = this.fingerprint.trim();
-    const session = this.zellijSession.trim();
+    // 通知只引用本地事件，通过已校验指纹的 SSH 连接到对应开发机后才解析会话。
+    const pushLink = this.pushLink;
+    const session = pushLink ? '' : this.zellijSession.trim();
     if (!host || !username || !/^\d{1,5}$/.test(this.port) || port < 1 || port > 65535) {
       this.errorText = '请填写主机地址、用户名和 1–65535 范围内的端口。';
       return;
@@ -206,8 +213,9 @@ struct Index {
 
     this.pendingConnection = {
       host, port, username, fingerprint, password: this.password, privateKey: this.privateKey,
-      passphrase: this.passphrase, zellijSession: session, columns: 80, rows: 24
+      passphrase: this.passphrase, zellijSession: session, pushLink, columns: 80, rows: 24
     };
+    this.openedPushLink = pushLink;
     this.clearCredentials();
     this.errorText = '';
     const generation = ++this.generation;
@@ -498,8 +506,25 @@ struct Index {
           Column({ space: 2 }) {
             Text('Nerve').fontFamily(APP_FONT).fontSize(25).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
             Text('SSH 连接').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
-          }.alignItems(HorizontalAlign.Start)
+          }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+          Button('推送通知', { type: ButtonType.Normal })
+            .fontFamily(APP_FONT).fontSize(13).fontColor(FOREGROUND).backgroundColor(SURFACE)
+            .borderRadius(8).height(36)
+            .onClick(() => { this.pushSettingsVisible = true; })
         }.width('100%').margin({ bottom: 8 })
+        if (this.pushLink) {
+          Row({ space: 10 }) {
+            Column({ space: 4 }) {
+              Text('通知关联会话').fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
+              Text('连接触发通知的开发机 · ' + this.pushLink.slice(0, 8))
+                .fontFamily(APP_FONT).fontSize(12).fontColor(MUTED)
+            }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+            Button('取消', { type: ButtonType.Normal })
+              .fontFamily(APP_FONT).fontSize(13).fontColor(FOREGROUND).backgroundColor(BACKGROUND)
+              .borderRadius(8).height(34)
+              .onClick(() => { AppStorage.set<string>('nervePushLink', ''); })
+          }.width('100%').padding(12).borderRadius(10).backgroundColor(SURFACE)
+        }
         this.field('主机地址', this.host, '例如 dev.example.local', InputType.Normal, 253,
           (value: string) => { this.host = value; })
         Row({ space: 10 }) {
@@ -514,8 +539,10 @@ struct Index {
         }.width('100%')
         this.field('主机指纹', this.fingerprint, 'SHA256:…', InputType.Normal, 64,
           (value: string) => { this.fingerprint = value; })
-        this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
-          (value: string) => { this.zellijSession = value; })
+        if (!this.pushLink) {
+          this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
+            (value: string) => { this.zellijSession = value; })
+        }
         Row({ space: 8 }) {
           this.authButton('密码', false)
           this.authButton('私钥', true)
@@ -539,7 +566,7 @@ struct Index {
           Text(this.errorText).fontFamily(APP_FONT).fontColor(ERROR).fontSize(14)
             .width('100%').copyOption(CopyOptions.LocalDevice)
         }
-        Button('连接', { type: ButtonType.Normal })
+        Button(this.pushLink ? '连接并打开会话' : '连接', { type: ButtonType.Normal })
           .width('100%')
           .height(48)
           .borderRadius(10)
@@ -565,11 +592,17 @@ struct Index {
     Column() {
       Row({ space: 10 }) {
         Column({ space: 4 }) {
-          Text(this.zellijSession.trim() || this.host.trim())
+          Text(this.openedPushLink ? this.host.trim() : this.zellijSession.trim() || this.host.trim())
             .fontFamily(APP_FONT).fontSize(17).fontWeight(FontWeight.Medium).fontColor(FOREGROUND).maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           Text(this.statusText).fontFamily(APP_FONT).fontSize(12).fontColor(this.connected ? ACCENT : MUTED)
         }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+        if (this.pushLink && this.pushLink !== this.openedPushLink) {
+          Button('查看通知', { type: ButtonType.Normal })
+            .height(34).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
+            .fontColor(BACKGROUND).backgroundColor(ACCENT)
+            .onClick(() => this.backToForm())
+        }
         Button(this.connected ? '断开' : '返回', { type: ButtonType.Normal })
           .height(34).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
           .fontColor(FOREGROUND).backgroundColor(SURFACE)
@@ -628,6 +661,8 @@ struct Index {
     Column() {
       if (this.terminalVisible) {
         this.terminalView()
+      } else if (this.pushSettingsVisible) {
+        PushSettings({ onClose: () => { this.pushSettingsVisible = false; } })
       } else {
         this.connectionForm()
       }

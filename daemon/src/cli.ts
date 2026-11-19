@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { fileURLToPath } from 'node:url';
-import { codexEvents, fromCodexHook } from './agent.js';
+import { codexEvents, fromCodexHook, isRecord, parseAgentEvent, uuidPattern } from './agent.js';
 import { nerveHome, requestJson } from './local-http.js';
+import { notificationFromEvent } from './notification.js';
 import { pushTargetFromEnv } from './push-client.js';
-import { listPanes, listSessions } from './zellij.js';
+import { attachExistingSession, listPanes, listSessions } from './zellij.js';
 
 function printJson(value: unknown) {
   process.stdout.write(JSON.stringify(value, null, 2) + '\n');
@@ -43,6 +44,30 @@ async function codexHook() {
   process.stdout.write('{}\n');
 }
 
+async function attachEvent(hostId: string | undefined, eventId: string | undefined) {
+  if (!hostId || !uuidPattern.test(hostId) || !eventId || !uuidPattern.test(eventId)) {
+    throw new Error('用法为 nerve attach-event <host-id> <event-id>');
+  }
+  // 先验证本机标识，避免用户选错开发机时打开同名会话。
+  const health = await requestJson('/v1/health');
+  if (!isRecord(health) || health.hostId !== hostId) throw new Error('此通知来自另一台开发机。');
+  let response: unknown;
+  try {
+    response = await requestJson('/v1/events/' + eventId);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'Daemon 返回 HTTP 404') {
+      throw new Error('当前 Daemon 找不到此通知对应的事件。');
+    }
+    throw error;
+  }
+  const event = parseAgentEvent(response);
+  if (!isRecord(response) || response.hostId !== hostId || !event || event.eventId !== eventId
+      || !notificationFromEvent(hostId, event) || !event.zellij) {
+    throw new Error('此通知没有关联的 Zellij 会话。');
+  }
+  process.exitCode = await attachExistingSession(event.zellij.sessionName);
+}
+
 async function main([command, arg, limit]: string[]) {
   switch (command) {
     case 'start': {
@@ -72,6 +97,9 @@ async function main([command, arg, limit]: string[]) {
       if (!arg) throw new Error('用法为 nerve panes <session>');
       printJson(await listPanes(arg));
       break;
+    case 'attach-event':
+      await attachEvent(arg, limit);
+      break;
     case 'codex-config':
       printJson(codexHookConfig());
       break;
@@ -80,7 +108,8 @@ async function main([command, arg, limit]: string[]) {
       break;
     case undefined:
     case '--help':
-      console.log('nerve start | health | push-status | events [after] [limit] | sessions | panes <session> | codex-config');
+      console.log('nerve start | health | push-status | events [after] [limit] | sessions | panes <session> | codex-config'
+        + ' | attach-event <host-id> <event-id>');
       break;
     default:
       throw new Error('未知命令，请运行 nerve --help');

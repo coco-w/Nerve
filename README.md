@@ -6,7 +6,7 @@ Nerve 是面向 HarmonyOS 的远程开发工具。手机通过 SSH 直连开发�
 
 - `entry/` 是 HarmonyOS 原生应用。手机通过 libssh2 直连主机，终端由本地打包的 xterm.js 绘制。可打开 Shell 或接入已有 Zellij 会话。连接页和终端默认使用内置的 Maple Mono NF CN 7.9。 [字体发布](https://github.com/subframe7536/maple-font/releases/tag/v7.9) · [字体许可证](entry/src/main/resources/rawfile/licenses/maple-mono-OFL)
 - `daemon/` 是 Node.js + TypeScript PoC。在同一系统用户下通过 Unix Socket 采集事件，写入 SQLite，并提供事件查询和 Zellij 会话、窗格列表。
-- Push Gateway 是独立运行的服务。Daemon 和 Gateway 分别用 SQLite 保存待发送通知，支持本地收件联调和 Huawei Push Kit V3。后续验证 Mosh、鸿蒙真机锁屏接收，以及点击通知回到会话。
+- Push Gateway 是独立运行的服务。Daemon 和 Gateway 分别用 SQLite 保存待发送通知，支持本地收件联调和 Huawei Push Kit V3。鸿蒙端提供通知授权、设备令牌导出和通知关联会话入口。后续验证 Mosh 和真机锁屏收通知。
 
 ## 手机连接 SSH
 
@@ -136,10 +136,27 @@ curl -fsS -H "Authorization: Bearer $NERVE_GATEWAY_TOKEN" http://127.0.0.1:8787/
 | `NERVE_HUAWEI_CATEGORY` | 默认 `WORK`，对应项目的工作事项提醒权益。可设为 `MARKETING`，适用华为的静默通知及频控规则 |
 | `NERVE_HUAWEI_TEST_MESSAGE` | 设为 `1` 时使用华为的测试消息模式 |
 
-Gateway 读取这两项华为凭据后开始投递其目录中待发送的通知。锁屏正文使用固定模板，点击消息打开应用首页，并携带主机 ID 和事件 ID。真机 Token 获取和点击回会话由鸿蒙端接入。 [华为消息字段和通知分类](https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-scenariozed-api-request-param/)
+1. 在 DevEco Studio 为与 AppGallery Connect 注册应用相同的包名启用 Push Kit，并更新调试签名后安装。Nerve 当前包名为 `com.example.nerve`。 [开通与调试签名](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-config-setting)
+2. 在 Nerve 连接页点击「推送通知」，允许系统通知，再点「获取令牌」和「保存令牌到文件」。将文件从手机传到运行 Gateway 的电脑，在启动环境中从文件读取 `NERVE_HUAWEI_PUSH_TOKEN`。 [华为获取 Push Token 指南](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/push-get-token/)
+3. 配置 Gateway 的两项华为凭据。比如在 WSL 用下面的命令从私有目录读取文件，再按前面的方式启动 Gateway。
+
+~~~bash
+export NERVE_HUAWEI_SERVICE_ACCOUNT_FILE="$HOME/.nerve-gateway/huawei-service-account.json"
+export NERVE_HUAWEI_PUSH_TOKEN="$(cat "$HOME/.nerve-gateway/nerve-push-token.txt")"
+export NERVE_HUAWEI_TEST_MESSAGE=1
+npm run gateway
+~~~
+
+Gateway 开始投递其目录中待发送的通知。锁屏正文使用固定模板。点击通知只传入主机 ID 和事件 ID。 [华为通知字段](https://developer.huawei.com/consumer/cn/doc/harmonyos-references/push-scenariozed-api-request-param/)
+
+### 从通知打开 Zellij 会话
+
+在触发通知的开发机（WSL 或 macOS）用运行 Daemon 的同一个系统用户将构建后的 `nerve` 加入 SSH 用户的 `PATH`，例如从本项目的 `daemon/` 运行 `npm run build && npm link`。若 Daemon 使用自定义 `NERVE_HOME`，让 SSH 的非交互命令也能读到该值。
+
+点击通知后，在「通知关联会话」页面使用目标主机的 SSH 凭据，点「连接并打开会话」。Nerve 在校验 SSH 指纹及 Daemon 主机 ID 后按事件 ID 查找原会话。已在终端时可以手动点「查看通知」切换。会话已关闭或改名时，终端显示原因。
 
 ## 验收
 
 在 WSL 的 `daemon/` 运行 `npm test`，验证字段映射、并发去重、输入大小、游标、推送事务、掉线重试、双方重启恢复以及 Huawei V3 的签名和响应解析。实机命令行联调使用真实 Codex 0.169.0、OMP 18.22.2 和 Zellij 0.46.0，模型回复由隔离的本地测试服务提供。上表 9 种原生事件均在实际运行中写入 SQLite，其中权限事件发生在 Codex 发出原生审批请求时。通过 `events` 查到各个 Agent 的原生事件后，可用 `panes` 核对 `zellij.paneId`。
 
-推送联调期间先保持 Gateway 离线。三种提醒由真实 Agent 事件触发，并在 Gateway 启动后各入库一次。Huawei V3 发送路径使用本地测试响应验收，设备实际接收待接入 Huawei Push Kit 后验证。
+推送联调期间先保持 Gateway 离线。三种提醒由真实 Agent 事件触发，并在 Gateway 启动后各入库一次。Huawei V3 发送路径使用本地测试响应验收。Mate 90 Pro1 模拟器已验证系统通知授权，以及模拟点击后经 SSH 进入 WSL 的已有 Zellij 会话。实际 Token 获取与锁屏送达待使用绑定 Push Kit 的调试签名验证。

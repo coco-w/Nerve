@@ -132,6 +132,7 @@ napi_value Connect(napi_env env, napi_callback_info info)
         request->options.username = StringProperty(env, options, "username", 256);
         request->options.fingerprint = StringProperty(env, options, "fingerprint", 50);
         request->options.zellijSession = StringProperty(env, options, "zellijSession", 128);
+        request->options.pushLink = StringProperty(env, options, "pushLink", 73);
         request->options.password = StringProperty(env, options, "password", 4096);
         request->options.privateKey = StringProperty(env, options, "privateKey", 32768);
         request->options.passphrase = StringProperty(env, options, "passphrase", 4096);

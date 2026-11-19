@@ -9,6 +9,7 @@
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <poll.h>
+#include <regex>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -31,6 +32,14 @@ bool IsSessionName(const std::string &name)
         std::all_of(name.begin(), name.end(), [](char ch) {
             return IsAlphaNumeric(ch) || ch == '_' || ch == '-' || ch == '.';
         }));
+}
+
+bool IsPushLink(const std::string &value)
+{
+    // 与服务端标识格式一致。UUID 通过校验后才能进入固定的远端 CLI 命令。
+    const std::string uuid = "[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}";
+    static const std::regex link(uuid + ":" + uuid);
+    return value.size() == 73 && std::regex_match(value, link);
 }
 
 void ValidateSize(PtySize size)
@@ -114,6 +123,9 @@ std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
     if (!IsSessionName(options.zellijSession)) {
         throw std::runtime_error("Zellij 会话名含有不支持的字符。");
     }
+    if (!options.pushLink.empty() && (!IsPushLink(options.pushLink) || !options.zellijSession.empty())) {
+        throw std::runtime_error("通知关联标识无效。");
+    }
     ValidateSize(options.size);
 
     static const int initResult = libssh2_init(0);
@@ -180,12 +192,20 @@ void SshSession::OpenPty(const ConnectOptions &options)
     if (libssh2_channel_handle_extended_data2(channel_, LIBSSH2_CHANNEL_EXTENDED_DATA_MERGE) != 0) {
         throw std::runtime_error("无法读取 SSH 终端的错误输出。");
     }
-    // 会话名已限制为普通标识符，远端命令仅附接指定的会话。
-    if (options.zellijSession.empty()) {
+    if (!options.pushLink.empty()) {
+        const auto &link = options.pushLink;
+        const std::string command = "/bin/sh -c 'if ! command -v nerve >/dev/null 2>&1; then "
+            "echo \"SSH 用户的 PATH 中没有 nerve。请在主机安装 Nerve CLI 后重试。\"; exit 127; fi; "
+            "exec nerve attach-event " + link.substr(0, 36) + " " + link.substr(37) + "'";
+        if (libssh2_channel_exec(channel_, command.c_str()) != 0) {
+            throw std::runtime_error("SSH 服务端未能启动通知会话。");
+        }
+    } else if (options.zellijSession.empty()) {
         if (libssh2_channel_shell(channel_) != 0) {
             throw std::runtime_error("SSH 服务端未能启动交互式终端。");
         }
     } else {
+        // 会话名已限制为普通标识符，远端命令仅附接指定的会话。
         // Zellij 0.46 的部分查询失败仍返回 0，检查精确会话是否返回 JSON 窗格列表。
         // 使用 /bin/sh 解析固定条件语句，兼容远端的 Bash、Zsh 和 Fish 登录 Shell。
         const std::string &name = options.zellijSession;

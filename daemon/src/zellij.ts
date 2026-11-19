@@ -1,4 +1,5 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { promisify } from 'node:util';
 import { isRecord } from './agent.js';
 
@@ -36,4 +37,17 @@ export async function listPanes(session: string) {
     }
     return { paneId: (pane.is_plugin ? 'plugin_' : 'terminal_') + pane.id, title: pane.title };
   });
+}
+
+export async function attachExistingSession(session: string): Promise<number> {
+  if (session.startsWith('-') || session === 'options' || session === 'help') {
+    throw new Error('该会话名与 Zellij 命令参数冲突，请手动进入会话。');
+  }
+  // 先核对完整名称和实际窗格，避免匹配同名前缀或复活已退出的会话。
+  if (!(await listSessions()).includes(session)) throw new Error('Zellij 会话已关闭或改名。');
+  await listPanes(session);
+  // 把 SSH 分配的终端交给 Zellij，断开手机时保留远端会话。
+  const child = spawn('zellij', ['attach', session, 'options', '--on-force-close', 'detach'], { stdio: 'inherit' });
+  const [code] = await once(child, 'exit') as [number | null, NodeJS.Signals | null];
+  return code ?? 1;
 }

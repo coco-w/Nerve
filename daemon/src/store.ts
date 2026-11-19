@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import type { StatementSync } from 'node:sqlite';
+import type { SQLOutputValue, StatementSync } from 'node:sqlite';
 import type { AgentEvent } from './agent.js';
 import { notificationFromEvent } from './notification.js';
 import { PushQueue } from './push-queue.js';
@@ -69,11 +69,20 @@ export class EventStore {
 
   after(sequence: number, limit: number): StoredEvent[] {
     // 游标按写入顺序推进，可以读取时间戳较早但刚刚到达的事件。
-    return this.list.all(sequence, limit).map(row => ({
+    return this.list.all(sequence, limit).map(row => this.decodeEvent(row));
+  }
+
+  find(eventId: string): StoredEvent | undefined {
+    const row = this.lookup.get(eventId);
+    return row ? this.decodeEvent(row) : undefined;
+  }
+
+  private decodeEvent(row: Record<string, SQLOutputValue>): StoredEvent {
+    return {
       ...JSON.parse(String(row.event_json)) as AgentEvent,
       sequence: Number(row.sequence),
       hostId: this.hostId,
-    }));
+    };
   }
 
   close() {

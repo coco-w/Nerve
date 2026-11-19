@@ -106,6 +106,10 @@ test('Unix Socket 校验来源映射、并发去重及 SQLite 重启恢复', { s
   assert.equal(page.events[0].hostId, health.body.hostId);
   assert.equal(page.events[0].eventId, event.eventId);
   assert.doesNotMatch(JSON.stringify(page), /private prompt|untrusted-host/);
+  // 通知打开时按事件 ID 定位，重启后仍返回同一条记录和主机标识。
+  assert.deepEqual(await http(socketPath, '/v1/events/' + event.eventId), { status: 200, body: page.events[0] });
+  assert.equal((await http(socketPath, '/v1/events/' + randomUUID())).status, 404);
+  assert.equal((await http(socketPath, '/v1/events/invalid')).status, 404);
   const nextPage = (await http(socketPath, '/v1/events?after=' + page.nextCursor)).body;
   assert.deepEqual(nextPage.events.map(event => event.eventId), [older.eventId]);
   assert.equal(nextPage.nextCursor, 2);

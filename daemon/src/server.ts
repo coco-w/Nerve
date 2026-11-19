@@ -1,7 +1,7 @@
 import { once } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { join } from 'node:path';
-import { parseAgentEvent } from './agent.js';
+import { parseAgentEvent, uuidPattern } from './agent.js';
 import { jsonServer, readJson, RequestError, sendJson } from './http-json.js';
 import { ensurePrivateDirectory } from './private-directory.js';
 import { deliverToGateway } from './push-client.js';
@@ -31,6 +31,12 @@ async function route(request: IncomingMessage, response: ServerResponse, store: 
     const limit = cursorParam(url.searchParams.get('limit'), 50, 1, 200);
     const events = store.after(after, limit);
     sendJson(response, 200, { events, nextCursor: events.at(-1)?.sequence ?? after });
+  } else if (request.method === 'GET' && url.pathname.startsWith('/v1/events/')) {
+    // 此查询仍经私有 Unix Socket，通知通过 SSH 在对应开发机上解析。
+    const eventId = url.pathname.slice('/v1/events/'.length);
+    const event = uuidPattern.test(eventId) ? store.find(eventId) : undefined;
+    if (!event) throw new RequestError(404, 'event_not_found');
+    sendJson(response, 200, event);
   } else if (request.method === 'POST' && url.pathname === '/v1/events') {
     const event = parseAgentEvent(await readJson(request, bodyLimit, 'event_too_large'));
     if (!event) throw new RequestError(422, 'invalid_event');
