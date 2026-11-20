@@ -1185,10 +1185,12 @@ struct Index {
         Text(server.alias || this.knownHostId(server.host, server.port))
           .fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          // 显示本条连接保存的固定 UDP 端口，便于核对公网转发。
-          Text(server.username + (server.zellijSession ? ' · ' + server.zellijSession : '') +
-            (server.useMosh ? ' · Mosh' : ' · SSH') +
-            (server.useMosh && !server.p2pEndpoint && server.moshPort > 0 ? ' · UDP ' + server.moshPort : ''))
+          // 固定端口优先显示，较长的账号和会话名仍可在后方省略。
+          Text(server.useMosh && !server.p2pEndpoint && server.moshPort > 0 ?
+            'Mosh · UDP ' + server.moshPort + ' · ' + server.username +
+            (server.zellijSession ? ' · ' + server.zellijSession : '') :
+            server.username + (server.zellijSession ? ' · ' + server.zellijSession : '') +
+            (server.useMosh ? ' · Mosh' : ' · SSH'))
           .fontFamily(APP_FONT).fontSize(12).fontColor(MUTED)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
       }.layoutWeight(1).alignItems(HorizontalAlign.Start)
