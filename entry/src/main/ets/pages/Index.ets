@@ -1185,8 +1185,10 @@ struct Index {
         Text(server.alias || this.knownHostId(server.host, server.port))
           .fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(server.username + (server.zellijSession ? ' · ' + server.zellijSession : '') +
-          (server.useMosh ? ' · Mosh' : ' · SSH'))
+          // 显示本条连接保存的固定 UDP 端口，便于核对公网转发。
+          Text(server.username + (server.zellijSession ? ' · ' + server.zellijSession : '') +
+            (server.useMosh ? ' · Mosh' : ' · SSH') +
+            (server.useMosh && !server.p2pEndpoint && server.moshPort > 0 ? ' · UDP ' + server.moshPort : ''))
           .fontFamily(APP_FONT).fontSize(12).fontColor(MUTED)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
       }.layoutWeight(1).alignItems(HorizontalAlign.Start)
@@ -1264,7 +1266,7 @@ struct Index {
       this.optionButton({ label: 'Mosh', selected: this.useMosh, onSelect: () => { this.useMosh = true; } })
     }.width('100%')
     if (this.useMosh && !this.p2pCode.trim()) {
-      this.field('Mosh UDP 端口', this.moshPortInput, '可选 · 自动分配', InputType.Number, 5,
+        this.field('Mosh UDP 端口', this.moshPortInput, '填写固定端口 · 留空自动分配', InputType.Number, 5,
         (value: string) => { this.moshPortInput = value; })
     }
     Row({ space: 8 }) {
