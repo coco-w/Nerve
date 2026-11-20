@@ -64,28 +64,37 @@ export async function startDaemon(directory: string, pushTarget?: PushTarget, p2
   const p2pModule = p2p && await import('./p2p/host.js');
   ensurePrivateDirectory(directory, 'NERVE_HOME');
   const socketPath = join(directory, 'nerve.sock');
-  const store = new EventStore(join(directory, 'events.sqlite'), pushTarget !== undefined);
-  const p2pSecret = p2p ? store.p2pSecret() : '';
-  // URL 片段用于给 App 配对，连接信令服务时只用前面的 WebSocket 地址。
-  const pairing = p2p ? p2p.url + '#' + store.hostId + '.' + p2pSecret : '';
+  let store: EventStore | undefined;
+  let pairing = '';
   // 停止命令走同一个用户私有 Socket，无需根据 PID 猜测要停止的进程。
-  const server = jsonServer('[Nerve]', (request, response) => route(request, response, store, stopListening, pairing));
+  const server = jsonServer('[Nerve]', async (request, response) => {
+    if (!store) throw new RequestError(503, 'daemon_starting');
+    return route(request, response, store, stopListening, pairing);
+  });
   function stopListening() {
     server.close();
   }
-  try {
-    server.listen(socketPath);
-    await once(server, 'listening');
-  } catch (error) {
-    store.close();
-    throw error;
-  }
-  const stop = pushTarget && startPushWorker(store.pushQueue, deliverToGateway(pushTarget), '[Nerve]');
-  const stopP2p = p2p && p2pModule?.startP2pHost(p2p, store.hostId, p2pSecret);
+  // 先占用 Socket，再初始化 SQLite，避免并发启动时两个进程同时创建数据库。
+  server.listen(socketPath);
+  await once(server, 'listening');
+
+  let stopPush: (() => void) | undefined;
+  let stopP2p: (() => void) | undefined;
   server.once('close', () => {
     stopP2p?.();
-    stop?.();
-    store.close();
+    stopPush?.();
+    store?.close();
   });
+  try {
+    store = new EventStore(join(directory, 'events.sqlite'), pushTarget !== undefined);
+    const p2pSecret = p2p ? store.p2pSecret() : '';
+    // URL 片段用于给 App 配对，连接信令服务时只用前面的 WebSocket 地址。
+    pairing = p2p ? p2p.url + '#' + store.hostId + '.' + p2pSecret : '';
+    stopPush = pushTarget && startPushWorker(store.pushQueue, deliverToGateway(pushTarget), '[Nerve]');
+    stopP2p = p2p && p2pModule?.startP2pHost(p2p, store.hostId, p2pSecret);
+  } catch (error) {
+    stopListening();
+    throw error;
+  }
   return { server, socketPath };
 }
