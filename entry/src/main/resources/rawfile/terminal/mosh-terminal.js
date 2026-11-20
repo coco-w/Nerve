@@ -8,6 +8,7 @@ const MOSH_REBIND_MS = 8000;
 const MOSH_MAX_SNAPSHOTS = 128;
 const MOSH_MAX_SNAPSHOT_CHARS = 6 * 1024 * 1024;
 const MOSH_MAX_PENDING_STATES = 32;
+const MOSH_RENDER_FALLBACK_MS = 100;
 
 function moshDecode(encoded) {
   return Uint8Array.from(atob(encoded), byte => byte.charCodeAt(0));
@@ -120,6 +121,8 @@ class MoshTerminal {
       return;
     }
     this.rendering = true;
+    const restoring = from !== this.displayed;
+    const previousScreen = restoring ? this.holdScreen() : undefined;
     const apply = () => {
       if (update.columns && update.rows) this.terminal.resize(update.columns, update.rows);
       this.terminal.write(update.screen, () => {
@@ -140,23 +143,70 @@ class MoshTerminal {
           (this.snapshots.size > MOSH_MAX_SNAPSHOTS || this.snapshotChars > MOSH_MAX_SNAPSHOT_CHARS)) {
           this.dropSnapshot(this.snapshots.keys().next().value);
         }
-        this.rendering = false;
-        if (update.ended) {
-          this.tick();
-          this.finish(this.closing ? 'closed' : 'ended');
-        } else {
-          this.paint();
-        }
+        this.showScreen(previousScreen, () => {
+          this.rendering = false;
+          if (update.ended) {
+            this.tick();
+            this.finish(this.closing ? 'closed' : 'ended');
+          } else {
+            this.paint();
+          }
+        });
       });
     };
-    if (from === this.displayed) {
+    if (!restoring) {
       apply();
     } else {
-      // 服务端可能仍依据早先的确认生成差量，用该状态复原后再渲染。
+      // 服务端可能依据较早的屏幕生成差量，先按旧网格恢复再应用更新。
       this.terminal.reset();
       this.terminal.resize(base.columns, base.rows);
       this.terminal.write(base.ansi, apply);
     }
+  }
+
+  holdScreen() {
+    const screen = this.terminal.element?.querySelector('.xterm-screen');
+    const parent = screen?.parentElement;
+    if (!parent) return undefined;
+
+    // xterm 复位和光标刷新都可能画出中间状态，先保留一份实际显示的画面。
+    const previous = document.createElement('div');
+    previous.className = 'nerve-mosh-previous-screen';
+    previous.setAttribute('aria-hidden', 'true');
+    Object.assign(previous.style, {
+      position: 'absolute',
+      inset: '0',
+      zIndex: '3',
+      overflow: 'hidden',
+      pointerEvents: 'none',
+      backgroundColor: this.terminal.options.theme?.background ?? '#000000'
+    });
+    const copy = screen.cloneNode(true);
+    Object.assign(copy.style, {
+      position: 'absolute',
+      left: screen.offsetLeft + 'px',
+      top: screen.offsetTop + 'px'
+    });
+    previous.appendChild(copy);
+    parent.appendChild(previous);
+    return previous;
+  }
+
+  showScreen(previous, done) {
+    if (!previous) {
+      done();
+      return;
+    }
+    const reveal = () => {
+      clearTimeout(timeout);
+      render.dispose();
+      previous.remove();
+      done();
+    };
+    const render = this.terminal.onRender(reveal);
+    // WebView 暂时不可见时可能没有绘制事件，到期后释放队列。
+    const timeout = setTimeout(reveal, MOSH_RENDER_FALLBACK_MS);
+    this.terminal.refresh(0, this.terminal.rows - 1);
   }
 
   dropSnapshot(state) {
