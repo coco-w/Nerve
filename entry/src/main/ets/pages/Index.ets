@@ -1,6 +1,6 @@
 import { webview } from '@kit.ArkWeb';
 import { preferences } from '@kit.ArkData';
-import { KeyboardAvoidMode } from '@kit.ArkUI';
+import { KeyboardAvoidMode, window } from '@kit.ArkUI';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { connect, daemonHealth, disconnect, exitStatus, PeerHandle, probeHostKey, read, rebindMosh, releasePeer, resize,
@@ -191,6 +191,23 @@ struct Index {
       familySrc: $rawfile('fonts/MapleMono-NF-CN-Regular.ttf')
     });
     this.loadSavedServers();
+  }
+
+  onPageShow(): void {
+    const context = this.getUIContext().getHostContext();
+    if (!context) return;
+    window.getLastWindow(context).then((mainWindow: window.Window): Promise<void> => {
+      // 主窗口、状态栏和底部手势区使用同一套连接页配色。
+      mainWindow.setWindowBackgroundColor(BACKGROUND);
+      return mainWindow.setWindowSystemBarProperties({
+        statusBarColor: BACKGROUND,
+        navigationBarColor: BACKGROUND,
+        statusBarContentColor: FOREGROUND,
+        navigationBarContentColor: FOREGROUND
+      });
+    }).catch(() => {
+      // 窗口切换期间可能暂时不可用，页面再次显示时会重试。
+    });
   }
 
   onBackPress(): boolean {
