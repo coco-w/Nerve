@@ -36,6 +36,8 @@ struct ConnectOptions {
     // 0 由 mosh-server 在默认范围内分配，正数指定单个可达的 UDP 端口。
     int moshPort = 0;
     std::shared_ptr<P2pTransport> peer;
+    // 同一安装中的已保存主机用此标识找回自己在固定端口上启动的进程。
+    std::string moshOwner;
 
     // 本地认证参数只用于建立连接，握手完成后清理原生侧副本。
     void ClearCredentials();

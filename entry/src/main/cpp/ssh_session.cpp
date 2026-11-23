@@ -19,10 +19,72 @@ namespace {
 
 constexpr int CONNECT_TIMEOUT_MS = 8000;
 constexpr int SSH_REQUEST_TIMEOUT_MS = 8000;
+// 固定端口续接允许服务端等到旧客户端离线，再重试一次绑定。
+constexpr int MOSH_RECOVERY_TIMEOUT_MS = 15000;
 constexpr int DAEMON_HEALTH_TIMEOUT_MS = 3200;
 constexpr size_t MAX_DAEMON_HEALTH_BYTES = 1024;
 constexpr size_t MAX_MOSH_START_BYTES = 4096;
 constexpr int MAX_PTY_DIMENSION = 500;
+
+// 状态文件只记录本安装、本主机所启动的进程身份，Mosh 密钥仍只走 SSH 握手。
+constexpr char FIXED_MOSH_LAUNCHER[] = R"MOSH(
+owner=$1
+port=$2
+shift 2
+state_dir="${HOME}/.cache/nerve/mosh"
+if [ -z "$HOME" ] || ! (umask 077; mkdir -p "$state_dir") 2>/dev/null; then
+    exec "$@" 2>&1
+fi
+state_file="$state_dir/$owner-$port"
+ssh_uid=$(id -u)
+
+# 用账号、进程名和启动时间识别 Mosh，避免把复用的 PID 当作旧连接。
+mosh_identity() {
+    case "$1" in ''|*[!0-9]*|0*|1) return 1 ;; esac
+    LC_ALL=C TZ=UTC ps -p "$1" -o uid= -o stat= -o lstart= -o comm= 2>/dev/null |
+        awk -v uid="$ssh_uid" '$1 == uid && $2 !~ /^Z/ && $NF ~ /(^|\/)mosh-server$/ { print $3, $4, $5, $6, $7 }'
+}
+
+start_mosh() {
+    status=0
+    output=$("$@" 2>&1) || status=$?
+}
+
+old_pid=''
+old_identity=''
+if [ -f "$state_file" ] && [ ! -L "$state_file" ]; then
+    { IFS= read -r old_pid && IFS= read -r old_identity; } < "$state_file"
+fi
+
+# SIGUSR1 只在 Mosh 确认一段时间未收到客户端状态时触发退出。
+export MOSH_SERVER_SIGNAL_TMOUT=6
+start_mosh "$@"
+if [ "$status" -eq 1 ] && [ -n "$old_identity" ] && [ "$(mosh_identity "$old_pid")" = "$old_identity" ]; then
+    case "$output" in *'Network exception: bind: Address already in use'*)
+        for attempt in 1 2 3 4 5 6 7 8 9; do
+            [ "$(mosh_identity "$old_pid")" = "$old_identity" ] || break
+            kill -USR1 "$old_pid" 2>/dev/null || break
+            sleep 1
+        done
+        if [ "$(mosh_identity "$old_pid")" != "$old_identity" ]; then
+            start_mosh "$@"
+        fi
+    ;; esac
+fi
+
+# 先原子写入进程记录，再交付握手票据，确保 App 随即退出也能续接。
+if [ "$status" -eq 0 ]; then
+    pid=$(printf '%s\n' "$output" | sed -n 's/^\[mosh-server detached, pid = \([0-9][0-9]*\)\]$/\1/p')
+    identity=$(mosh_identity "$pid")
+    if [ -n "$identity" ] && tmp=$(mktemp "$state_file.XXXXXX" 2>/dev/null); then
+        if ! { printf '%s\n%s\n' "$pid" "$identity" > "$tmp" && mv -f "$tmp" "$state_file"; }; then
+            rm -f "$tmp"
+        fi
+    fi
+fi
+printf '%s\n' "$output"
+exit "$status"
+)MOSH";
 
 bool IsAlphaNumeric(char ch)
 {
@@ -165,6 +227,11 @@ std::unique_ptr<SshSession> SshSession::Connect(const ConnectOptions &options)
     }
     if (options.moshPort < 0 || options.moshPort > 65535) {
         throw std::runtime_error("Mosh UDP 端口无效。");
+    }
+    // 限制本地安装标识的字符，供远端固定目录下的文件名使用。
+    static const std::regex moshOwner("[a-f0-9]{32}-[1-9][0-9]{0,15}");
+    if (!options.moshOwner.empty() && !std::regex_match(options.moshOwner, moshOwner)) {
+        throw std::runtime_error("Mosh 续接标识无效。");
     }
     ValidateSize(options.size);
 
@@ -310,20 +377,26 @@ void SshSession::OpenMosh(const ConnectOptions &options)
         "if [ \"$(LC_ALL=$lang locale charmap 2>/dev/null)\" = UTF-8 ]; then export LC_ALL=$lang; break; fi; "
         "done; fi; "
         // 保留远端设置，默认回收异常退出的客户端遗留的服务端进程。
-        "export MOSH_SERVER_NETWORK_TMOUT=\"${MOSH_SERVER_NETWORK_TMOUT:-86400}\"; "
-        "exec mosh-server new -s -c 256";
+        "export MOSH_SERVER_NETWORK_TMOUT=\"${MOSH_SERVER_NETWORK_TMOUT:-86400}\"; ";
+    std::string command = "mosh-server new -s -c 256";
     if (options.moshPort > 0) {
-        script += " -p " + std::to_string(options.moshPort);
+        command += " -p " + std::to_string(options.moshPort);
     }
     const std::string terminal = TerminalCommand(options);
     if (!terminal.empty()) {
-        script += " -- /bin/sh -c " + ShellQuote(terminal);
+        command += " -- /bin/sh -c " + ShellQuote(terminal);
     }
+    const bool recover = options.moshPort > 0 && !options.moshOwner.empty() && !peer_;
     // 收集 mosh-server 的启动诊断，只向界面返回已识别的错误，不转发原始输出。
-    script += " 2>&1";
+    if (recover) {
+        script += "exec /bin/sh -c " + ShellQuote(FIXED_MOSH_LAUNCHER) + " nerve-mosh " +
+            ShellQuote(options.moshOwner) + " " + std::to_string(options.moshPort) + " " + command;
+    } else {
+        script += "exec " + command + " 2>&1";
+    }
     std::string output;
     const int status = RunCommand("/bin/sh -c " + ShellQuote(script), output,
-        SSH_REQUEST_TIMEOUT_MS, MAX_MOSH_START_BYTES);
+        recover ? MOSH_RECOVERY_TIMEOUT_MS : SSH_REQUEST_TIMEOUT_MS, MAX_MOSH_START_BYTES);
     if (status == 127 || output == "NERVE_MOSH_UNAVAILABLE\n") {
         ClearSecret(output);
         throw std::runtime_error("在开发机的 SSH PATH 中找不到 mosh-server，请安装 Mosh 或选择 SSH。");

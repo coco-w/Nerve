@@ -234,6 +234,11 @@ napi_value Connect(napi_env env, napi_callback_info info)
         if (request->options.useMosh && moshPortProvided) {
             request->options.moshPort = IntProperty(env, options, "moshPort");
         }
+        bool moshOwnerProvided = false;
+        Check(napi_has_named_property(env, options, "moshOwner", &moshOwnerProvided));
+        if (request->options.moshPort > 0 && !request->options.peer && moshOwnerProvided) {
+            request->options.moshOwner = StringProperty(env, options, "moshOwner", 49);
+        }
         request->options.password = StringProperty(env, options, "password", 4096);
         request->options.privateKey = StringProperty(env, options, "privateKey", 32768);
         request->options.passphrase = StringProperty(env, options, "passphrase", 4096);

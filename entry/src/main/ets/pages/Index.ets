@@ -912,6 +912,25 @@ struct Index {
     }
   }
 
+  // 安装标识在启动 Mosh 前落盘，应用被系统结束后仍能识别这个主机的旧连接。
+  private async fixedMoshOwner(serverId: number): Promise<string> {
+    const context = this.getUIContext().getHostContext();
+    if (!context) return '';
+    try {
+      const store = preferences.getPreferencesSync(context, { name: 'nerve_mosh' });
+      let owner = String(store.getSync('owner', ''));
+      if (!/^[a-f0-9]{32}$/.test(owner)) {
+        owner = util.generateRandomUUID().replace(/-/g, '').toLowerCase();
+        store.putSync('owner', owner);
+      }
+      await store.flush();
+      return owner + '-' + String(serverId);
+    } catch (_) {
+      // 存储暂不可用时仍可按原方式连接空闲端口。
+      return '';
+    }
+  }
+
   private async openConnection(request: SshOpenRequest, generation: number): Promise<void> {
     const options = request.options;
     let peer: PeerHandle | undefined;
@@ -923,6 +942,10 @@ struct Index {
       }
       this.statusText = options.useMosh ? '正在通过 SSH 启动 Mosh' : '正在连接 SSH';
       if (request.server) {
+        if (options.useMosh && options.moshPort && !request.pairing) {
+          options.moshOwner = await this.fixedMoshOwner(request.server.id);
+          if (this.generation !== generation) return;
+        }
         const credentials = await this.savedServerStore().credentials(request.server);
         if (this.generation !== generation) {
           return;

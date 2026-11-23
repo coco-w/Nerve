@@ -20,6 +20,8 @@ export interface SshConnectOptions extends SshEndpoint {
   discoverDaemon?: boolean;
   useMosh?: boolean;
   moshPort?: number;
+  // 已保存的直连主机用于恢复固定端口的本地标识。
+  moshOwner?: string;
   columns: number;
   rows: number;
 }
