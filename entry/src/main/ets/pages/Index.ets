@@ -10,12 +10,15 @@ import { PushSettings } from '../push/PushSettings';
 import { dialP2p, P2pPairing, parseP2pPairing } from '../ssh/P2pClient';
 import { SavedSshServer, SshCredentials, SshServerSettings, SshServerStore } from '../ssh/SshServerStore';
 import { NerveTerminalMenu, NERVE_TERMINAL_MENU_BACKGROUND } from '../ui/TerminalMenu';
-import { ACCENT, APP_FONT, BACKGROUND, ERROR, FOREGROUND, MUTED, SURFACE } from '../ui/Theme';
+import { APP_FONT, nerveColors, NerveColors, PALETTES, TERMINAL_BACKGROUND, TERMINAL_MUTED, TERMINAL_SURFACE,
+  TERMINAL_TEXT, ThemePalette } from '../ui/Theme';
 
 // ArkWeb 拦截时使用资源 URL，加载后可能显示为 RAWFILE 格式。
 const TERMINAL_URL = 'resource://rawfile/terminal/index.html';
 const TERMINAL_LOADED_URL = 'resource:/RAWFILE/terminal/index.html';
 const TERMINAL_FILE_URL = 'file:///data/storage/el1/bundle/entry/resources/rawfile/terminal/index.html';
+// 终端工具栏和底部手势区共用底色。
+const TERMINAL_TOOLBAR_BACKGROUND = '#171b2a';
 const POLL_MS = 30;
 const MAX_CHUNK_BYTES = 16 * 1024;
 const MAX_QUEUED_BYTES = 64 * 1024;
@@ -28,6 +31,13 @@ const MOSH_CLOSE_MS = 1500;
 const SESSION_UNAVAILABLE_EXIT_STATUS = 20;
 // 应用本地的 SSH 信任记录，按主机和端口保存指纹。
 const KNOWN_HOSTS_STORE = 'nerve_known_hosts';
+const UI_STORE = 'nerve_ui';
+const RECENT_LIMIT = 8;
+
+interface RecentSession {
+  serverId: number;
+  openedAt: number;
+}
 
 interface PtySize {
   columns: number;
@@ -120,13 +130,27 @@ class TerminalBridge {
 @Component
 struct Index {
   @StorageProp('nervePushLink') @Watch('onPushLinkChanged') private pushLink: string = '';
+  @StorageProp('nerveKeyboardHeight') @Watch('onKeyboardHeightChanged') private keyboardHeight: number = 0;
+  @State private activeTab: number = 0;
+  @State private utilityPage: string = 'settings';
+  @State private utilityVisible: boolean = false;
   @State private pushSettingsVisible: boolean = false;
+  @State private darkAppearance: boolean = false;
+  @State private colors: NerveColors = nerveColors('indigo', false);
+  @State private preferenceError: string = '';
+  @State private recentSessions: RecentSession[] = [];
+  @State private pickingNotificationHost: boolean = false;
+  @State private pairedConnection: boolean = false;
+  @State private advancedConnection: boolean = false;
+  @State private terminalKeysVisible: boolean = false;
+  @State private terminalEnded: boolean = false;
+  @State private terminalServerId: number = 0;
+  @State private openedHostLabel: string = '';
   @State private openedPushLink: string = '';
   @State private openedRemoteTitle: string = '';
   @State @Watch('updateNotificationMatch') private savedServers: SavedSshServer[] = [];
   @State private notificationServer: SavedSshServer | undefined = undefined;
   @State private editingServer: SavedSshServer | undefined = undefined;
-  // 首页始终是主机列表，新增和编辑操作才打开表单。
   @State private serverEditorOpen: boolean = false;
   @State private managingServers: boolean = false;
   @State private serverListUnavailable: boolean = false;
@@ -144,7 +168,7 @@ struct Index {
   @State private passphrase: string = '';
   @State private checkingHostKey: boolean = false;
   @State private hostKeyReview: HostKeyReview | undefined = undefined;
-  @State private terminalVisible: boolean = false;
+  @State @Watch('syncSystemBars') private terminalVisible: boolean = false;
   @State private terminalInstance: number = 0;
   // 终端菜单独立于首页设置弹层，关闭菜单时保留当前连接。
   @State private terminalMenuVisible: boolean = false;
@@ -156,6 +180,9 @@ struct Index {
 
   private privateKey: string = '';
   private serverStore: SshServerStore | undefined;
+  private uiPreferences: preferences.Preferences | undefined;
+  private preferenceWrite: Promise<void> = Promise.resolve();
+  private recentServerId: number = 0;
   private formKeyboardMode: KeyboardAvoidMode = KeyboardAvoidMode.OFFSET;
   private view = new webview.WebviewController();
   private readonly encoder = new util.TextEncoder();
@@ -193,29 +220,112 @@ struct Index {
       familyName: APP_FONT,
       familySrc: $rawfile('fonts/MapleMono-NF-CN-Regular.ttf')
     });
+    this.loadUiPreferences();
     this.loadSavedServers();
   }
 
   onPageShow(): void {
+    this.syncSystemBars();
+  }
+
+  private syncSystemBars(): void {
     const context = this.getUIContext().getHostContext();
     if (!context) return;
     window.getLastWindow(context).then((mainWindow: window.Window): Promise<void> => {
-      // 主窗口、状态栏和底部手势区使用同一套连接页配色。
-      mainWindow.setWindowBackgroundColor(BACKGROUND);
+      // 取得窗口后再读取主题和页面状态，快速切换时使用当前颜色。
+      const top = this.terminalVisible ? TERMINAL_BACKGROUND : this.colors.background;
+      const bottom = this.terminalVisible ? TERMINAL_TOOLBAR_BACKGROUND : this.colors.background;
+      const foreground = this.terminalVisible ? TERMINAL_TEXT : this.colors.foreground;
+      // 底部手势区绘制在窗口背景上，状态栏另行使用顶部底色。
+      mainWindow.setWindowBackgroundColor(bottom);
       return mainWindow.setWindowSystemBarProperties({
-        statusBarColor: BACKGROUND,
-        navigationBarColor: BACKGROUND,
-        statusBarContentColor: FOREGROUND,
-        navigationBarContentColor: FOREGROUND
+        statusBarColor: top,
+        navigationBarColor: bottom,
+        statusBarContentColor: foreground,
+        navigationBarContentColor: foreground
       });
     }).catch(() => {
       // 窗口切换期间可能暂时不可用，页面再次显示时会重试。
     });
   }
 
+  private loadUiPreferences(): void {
+    const context = this.getUIContext().getHostContext();
+    if (!context) return;
+    try {
+      const store = preferences.getPreferencesSync(context, { name: UI_STORE });
+      this.uiPreferences = store;
+      this.darkAppearance = store.getSync('dark', false) === true;
+      this.colors = nerveColors(String(store.getSync('palette', 'indigo')), this.darkAppearance);
+      const recent = JSON.parse(String(store.getSync('recent', '[]'))) as RecentSession[];
+      if (Array.isArray(recent)) {
+        this.recentSessions = recent.filter((item: RecentSession): boolean =>
+          !!item && Number.isInteger(item.serverId) && item.serverId > 0 &&
+          Number.isFinite(item.openedAt) && item.openedAt > 0).slice(0, RECENT_LIMIT);
+      }
+    } catch (_) {
+      // 保留已经读取的外观，其余界面可在没有历史记录时正常打开。
+    }
+  }
+
+  private persistUiPreferences(appearance: boolean): void {
+    const store = this.uiPreferences;
+    if (!store) {
+      if (appearance) this.preferenceError = '暂时无法保存外观设置。';
+      return;
+    }
+    try {
+      if (appearance) {
+        this.preferenceError = '';
+        store.putSync('dark', this.darkAppearance);
+        store.putSync('palette', this.colors.palette.id);
+      } else {
+        store.putSync('recent', JSON.stringify(this.recentSessions));
+      }
+      this.preferenceWrite = this.preferenceWrite.then(() => store.flush()).catch(() => {
+        if (appearance) this.preferenceError = '无法保存外观设置，请重试。';
+      });
+    } catch (_) {
+      if (appearance) this.preferenceError = '无法保存外观设置，请重试。';
+    }
+  }
+
+  private changeAppearance(palette: string, dark: boolean): void {
+    this.darkAppearance = dark;
+    this.colors = nerveColors(palette, dark);
+    this.syncSystemBars();
+    this.persistUiPreferences(true);
+  }
+
+  private rememberRecentConnection(): void {
+    const id = this.recentServerId;
+    if (!id) return;
+    this.recentServerId = 0;
+    const recent: RecentSession = { serverId: id, openedAt: Date.now() };
+    this.recentSessions = [recent,
+      ...this.recentSessions.filter((item: RecentSession): boolean => item.serverId !== id)].slice(0, RECENT_LIMIT);
+    this.persistUiPreferences(false);
+  }
+
+  private forgetRecentConnection(id: number): void {
+    if (this.recentSessions.some((item: RecentSession): boolean => item.serverId === id)) {
+      this.recentSessions = this.recentSessions.filter((item: RecentSession): boolean => item.serverId !== id);
+      this.persistUiPreferences(false);
+    }
+  }
+
+  private showUtility(page: string): void {
+    this.utilityPage = page;
+    this.utilityVisible = true;
+  }
+
   onBackPress(): boolean {
     if (this.terminalMenuVisible) {
       this.terminalMenuVisible = false;
+      return true;
+    }
+    if (this.utilityVisible) {
+      this.utilityVisible = false;
       return true;
     }
     if (this.hostKeyReview) {
@@ -242,11 +352,23 @@ struct Index {
       this.setServerEditor(false);
       return true;
     }
+    if (this.pickingNotificationHost) {
+      this.pickingNotificationHost = false;
+      return true;
+    }
+    if (this.activeTab !== 0) {
+      this.changeTab(0);
+      return true;
+    }
     return false;
   }
 
   private onPushLinkChanged(): void {
-    if (this.pushLink) this.pushSettingsVisible = false;
+    this.pickingNotificationHost = false;
+    if (this.pushLink) {
+      this.pushSettingsVisible = false;
+      if (this.utilityPage === 'settings') this.utilityVisible = false;
+    }
     this.updateNotificationMatch();
   }
 
@@ -264,15 +386,46 @@ struct Index {
     if (!server || !link || this.managingServers || this.checkingHostKey) {
       return;
     }
-    // 收到或点击系统通知只选中服务器，由用户点「打开会话」后才读取凭据。
+    this.followNotification(() => this.startConnection(server, link));
+  }
+
+  private async followNotification(open: () => void): Promise<void> {
+    const link = this.pushLink;
+    this.utilityVisible = false;
     if (this.terminalVisible) {
+      if (!this.terminalEnded) {
+        const generation = this.generation;
+        try {
+          const result = await this.getUIContext().getPromptAction().showDialog({
+            title: '切换会话？',
+            message: '将断开当前手机连接。远端 Zellij 会话会继续运行。',
+            buttons: [{ text: '取消', color: this.colors.muted }, { text: '继续', color: this.colors.accent }]
+          });
+          if (result.index !== 1 || generation !== this.generation || link !== this.pushLink) return;
+        } catch (_) {
+          return;
+        }
+      }
       this.closeTerminal(() => {
         this.backToForm();
-        this.startConnection(server, link);
+        if (link === this.pushLink) open();
       });
     } else {
-      this.startConnection(server, link);
+      open();
     }
+  }
+
+  private chooseNotificationHost(): void {
+    this.followNotification(() => {
+      this.changeTab(1);
+      this.pickingNotificationHost = true;
+    });
+  }
+
+  private changeTab(tab: number): void {
+    this.activeTab = tab;
+    this.errorText = '';
+    if (tab === 0) this.pickingNotificationHost = false;
   }
 
   private useSavedServer(id: number, edit: boolean): void {
@@ -284,7 +437,7 @@ struct Index {
     if (edit) {
       this.setServerEditor(true, server);
     } else {
-      this.startConnection(server, this.notificationServer ? '' : this.pushLink);
+      this.startConnection(server, this.pickingNotificationHost ? this.pushLink : '');
     }
   }
 
@@ -337,6 +490,8 @@ struct Index {
     this.serverAlias = server?.alias ?? '';
     this.host = server?.p2pEndpoint ? '' : server?.host ?? '';
     this.p2pCode = server?.p2pEndpoint ?? '';
+    this.pairedConnection = !!server?.p2pEndpoint;
+    this.advancedConnection = !!server?.moshPort;
     this.port = server ? String(server.port) : '22';
     this.username = server?.username ?? '';
     this.zellijSession = server?.zellijSession ?? '';
@@ -344,6 +499,14 @@ struct Index {
     this.moshPortInput = server?.moshPort ? String(server.moshPort) : '';
     this.usePrivateKey = server?.usePrivateKey ?? false;
     this.serverEditorOpen = isOpen;
+  }
+
+  private usePairedConnection(paired: boolean): void {
+    if (this.pairedConnection === paired) return;
+    this.pairedConnection = paired;
+    this.p2pCode = paired ? this.editingServer?.p2pEndpoint ?? '' : '';
+    this.advancedConnection = false;
+    this.errorText = '';
   }
 
   private formHost(): string {
@@ -355,7 +518,7 @@ struct Index {
 
   private formSettings(useSession: boolean): SshServerSettings | undefined {
     const pairing = parseP2pPairing(this.p2pCode);
-    if (this.p2pCode.trim() && !pairing) {
+    if (this.pairedConnection && !pairing) {
       this.errorText = '请粘贴 nerve pair 输出的 P2P 配对地址。';
       return undefined;
     }
@@ -437,6 +600,10 @@ struct Index {
       const saved = await storage.save(server, credentials, editing, secret || undefined);
       this.savedServers = editingId === undefined ? [saved, ...this.savedServers] :
         this.savedServers.map((item: SavedSshServer): SavedSshServer => item.id === saved.id ? saved : item);
+      if (editing && (saved.host !== editing.host || saved.port !== editing.port || saved.username !== editing.username ||
+        saved.zellijSession !== editing.zellijSession || saved.p2pEndpoint !== editing.p2pEndpoint)) {
+        this.forgetRecentConnection(saved.id);
+      }
       this.setServerEditor(false);
     } catch (_) {
       this.errorText = '无法保存服务器，请重试。';
@@ -467,6 +634,7 @@ struct Index {
     try {
       await this.savedServerStore().remove(server.id);
       this.savedServers = this.savedServers.filter((item: SavedSshServer): boolean => item.id !== server.id);
+      this.forgetRecentConnection(server.id);
       this.setServerEditor(false);
     } catch (_) {
       this.errorText = '无法删除服务器，请重试。';
@@ -677,8 +845,14 @@ struct Index {
     this.receivedTerminalOutput = false;
     this.moshActive = request.options.useMosh === true;
     this.openedPushLink = request.options.pushLink;
-    this.openedRemoteTitle = request.options.zellijSession || (request.options.pushLink ?
-      this.knownHostId(request.options.host, request.options.port) : request.options.host);
+    if (this.openedPushLink) this.pickingNotificationHost = false;
+    this.openedRemoteTitle = request.options.zellijSession || (request.options.pushLink ? '通知会话' : 'Shell');
+    this.openedHostLabel = request.server ? this.hostLabel(request.server) :
+      (this.serverAlias.trim() || (request.pairing ? 'P2P 主机' : request.options.host));
+    this.terminalServerId = request.server?.id ?? 0;
+    this.recentServerId = request.options.pushLink ? 0 : this.terminalServerId;
+    this.terminalEnded = false;
+    this.terminalKeysVisible = false;
     this.clearCredentials();
     this.errorText = '';
     const generation = ++this.generation;
@@ -781,6 +955,7 @@ struct Index {
       } else {
         this.connected = true;
         this.statusText = request.pairing ? 'SSH 已连接 · P2P 直连' : 'SSH 已连接';
+        this.rememberRecentConnection();
       }
       this.ioTimer = setInterval(() => this.pumpTerminal(), POLL_MS);
       if (request.server && options.discoverDaemon) {
@@ -898,11 +1073,13 @@ struct Index {
     if (status === 'online') {
       this.connected = true;
       this.statusText = this.p2pSession ? 'Mosh 已连接 · P2P 直连' : 'Mosh 已连接';
+      this.rememberRecentConnection();
     } else if (status === 'waiting') {
       const port = this.p2pSession ? ' · P2P' : ' · UDP ' + this.moshPort;
       this.statusText = this.connected ? 'Mosh 等待网络恢复' + port : '等待 Mosh 响应' + port;
     } else if (status === 'ended') {
       this.stopConnection();
+      this.terminalEnded = true;
       this.statusText = '远端 Mosh 会话已结束';
     } else if (status === 'error') {
       this.onTerminalError();
@@ -936,6 +1113,7 @@ struct Index {
     this.terminalMenuVisible = false;
     this.stopConnection();
     this.terminalVisible = false;
+    this.terminalKeysVisible = false;
     this.getUIContext().setKeyboardAvoidMode(this.formKeyboardMode);
     this.errorText = '';
   }
@@ -957,6 +1135,7 @@ struct Index {
     this.moshPumpPending = false;
     this.closingMosh = false;
     this.pendingConnection = undefined;
+    this.recentServerId = 0;
     const connection = this.connection;
     this.connection = undefined;
     if (connection) {
@@ -1104,6 +1283,7 @@ struct Index {
           this.errorText = '未能打开通知对应的会话，请确认会话仍在运行。';
         }
         this.stopConnection();
+        this.terminalEnded = true;
         this.statusText = sessionClosed ? 'Zellij 会话已关闭或改名' : '远端已断开';
         return;
       }
@@ -1113,6 +1293,7 @@ struct Index {
       this.runTerminalScript('window.nerveTerminal.write(' + JSON.stringify(encoded) + ')');
     } catch (error) {
       this.stopConnection();
+      this.terminalEnded = true;
       this.statusText = 'SSH 已断开';
       this.errorText = (error as Error).message || '终端连接中断。';
     }
@@ -1135,6 +1316,7 @@ struct Index {
     const mosh = this.moshActive;
     if (this.connected) {
       this.stopConnection();
+      this.terminalEnded = true;
       this.statusText = mosh ? 'Mosh 已断开' : 'SSH 已断开';
       this.errorText = '终端显示中断，请重新连接。';
     } else if (this.terminalVisible) {
@@ -1142,170 +1324,399 @@ struct Index {
     }
   }
 
+  private hostLabel(server: SavedSshServer): string {
+    return server.alias || (server.p2pEndpoint ? 'P2P 主机' : this.knownHostId(server.host, server.port));
+  }
+
+  private serverById(id: number): SavedSshServer {
+    // 首页只为当前仍存在的主机构建最近会话。
+    return this.savedServers.find((item: SavedSshServer): boolean => item.id === id)!;
+  }
+
+  private availableRecents(): RecentSession[] {
+    return this.recentSessions.filter((recent: RecentSession): boolean =>
+      this.savedServers.some((server: SavedSshServer): boolean => recent.serverId === server.id));
+  }
+
+  private relativeTime(openedAt: number): string {
+    const minutes = Math.max(0, Math.floor((Date.now() - openedAt) / 60000));
+    if (minutes < 1) return '刚刚';
+    if (minutes < 60) return minutes + ' 分钟前';
+    if (minutes < 1440) return Math.floor(minutes / 60) + ' 小时前';
+    return Math.floor(minutes / 1440) + ' 天前';
+  }
+
+  private addHost(): void {
+    this.activeTab = 1;
+    this.setServerEditor(true);
+  }
+
+  private onKeyboardHeightChanged(): void {
+    if (this.terminalVisible) this.terminalKeysVisible = this.keyboardHeight > 0;
+  }
+
+  private toggleTerminalKeyboard(): void {
+    this.terminalKeysVisible = !this.terminalKeysVisible;
+    if (this.terminalKeysVisible) {
+      try {
+        this.getUIContext().getFocusController().requestFocus('nerve-terminal');
+      } catch (_) {
+        // 软键盘焦点仍由内置终端尝试获取。
+      }
+      this.runTerminalScript('window.nerveTerminal.focus()');
+    } else {
+      this.ctrlArmed = false;
+      this.runTerminalScript('window.nerveTerminal.blur()');
+    }
+  }
+
+  private reconnectTerminal(): void {
+    const server = this.savedServers.find((item: SavedSshServer): boolean => item.id === this.terminalServerId);
+    if (!server || !this.terminalEnded || this.managingServers) return;
+    const link = this.openedPushLink;
+    this.backToForm();
+    this.startConnection(server, link);
+  }
+
+  @Builder
+  iconButton(mark: Resource | string, label: string, onClick: () => void, terminal: boolean = false) {
+    Button({ type: ButtonType.Normal }) {
+      if (typeof mark === 'string') {
+        Text(mark).fontSize(23).fontColor(terminal ? TERMINAL_TEXT : this.colors.foreground)
+      } else {
+        SymbolGlyph(mark).fontSize(20).fontColor([terminal ? TERMINAL_TEXT : this.colors.foreground])
+      }
+    }
+    .width(44).height(44).borderRadius(13).backgroundColor(Color.Transparent)
+    .accessibilityText(label).focusOnTouch(!terminal).onClick(onClick)
+  }
+
   @Builder
   field(label: string, value: string, placeholder: string, inputType: InputType, max: number,
     change: (value: string) => void) {
-    Column({ space: 6 }) {
-      Text(label).fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
+    Column({ space: 5 }) {
+      Text(label).fontSize(13).fontWeight(FontWeight.Medium).fontColor(this.colors.muted)
       TextInput({ text: value, placeholder: placeholder })
-        .type(inputType)
-        .maxLength(max)
-        .height(44)
-        .fontSize(15)
-        .fontFamily(APP_FONT)
-        .fontColor(FOREGROUND)
-        .placeholderFont({ size: 15, family: APP_FONT })
-        .placeholderColor(MUTED)
-        .backgroundColor(SURFACE)
-        .borderRadius(10)
+        .type(inputType).maxLength(max).height(46).fontSize(16)
+        .fontColor(this.colors.foreground).placeholderColor(this.colors.muted)
+        .backgroundColor(this.colors.surface).border({ width: 1, color: this.colors.line }).borderRadius(12)
         .onChange(change)
-    }
-    .alignItems(HorizontalAlign.Start)
-    .width('100%')
+    }.alignItems(HorizontalAlign.Start).width('100%')
   }
 
   @Builder
   optionButton($$: NerveOptionButtonParams) {
-    // 按引用读取选中状态，切换时同步刷新按钮和输入项。
     Button($$.label, { type: ButtonType.Normal })
-      .layoutWeight(1)
-      .height(38)
-      .borderRadius(8)
-      .fontFamily(APP_FONT)
-      .fontSize(14)
-      .fontColor($$.selected ? BACKGROUND : FOREGROUND)
-      .backgroundColor($$.selected ? ACCENT : SURFACE)
-      .onClick($$.onSelect)
+      .layoutWeight(1).height(44).borderRadius(10).fontSize(14).fontWeight(FontWeight.Medium)
+      .fontColor($$.selected ? this.colors.accent : this.colors.muted)
+      .backgroundColor($$.selected ? this.colors.surface : Color.Transparent)
+      .accessibilitySelected($$.selected).onClick($$.onSelect)
   }
 
   @Builder
-  formatKey(label: string, name: string, description: string) {
+  actionButton(label: string, onClick: () => void, primary: boolean = true) {
     Button(label, { type: ButtonType.Normal })
-      .layoutWeight(1)
-      .padding(0)
-      .height(38)
-      .borderRadius(8)
-      .fontFamily(APP_FONT)
-      .fontSize(14)
-      .fontColor(FOREGROUND)
-      .backgroundColor(SURFACE)
-      .accessibilityText(description)
-      .focusOnTouch(false)
-      .enabled(this.connected)
-      .onClick(() => this.runTerminalScript('window.nerveTerminal.key(' + JSON.stringify(name) + ')'))
+      .layoutWeight(1).height(46).borderRadius(12).fontSize(14).fontWeight(FontWeight.Medium)
+      .fontColor(primary ? Color.White : this.colors.foreground)
+      .backgroundColor(primary ? this.colors.palette.action : this.colors.surface)
+      .border({ width: primary ? 0 : 1, color: this.colors.line }).onClick(onClick)
+  }
+
+  @Builder
+  sectionLabel(text: string) {
+    Text(text).fontSize(14).fontWeight(FontWeight.Bold).fontColor(this.colors.foreground)
+      .width('100%').margin({ top: 8 })
+  }
+
+  @Builder
+  tile(mark: Resource | string, warning: boolean = false) {
+    Stack() {
+      if (typeof mark === 'string') {
+        Text(mark).fontFamily(APP_FONT).fontSize(16).fontWeight(FontWeight.Bold)
+          .fontColor(warning ? this.colors.warning : this.colors.accent)
+      } else {
+        SymbolGlyph(mark).fontSize(19).fontColor([warning ? this.colors.warning : this.colors.accent])
+      }
+    }.width(36).height(36).borderRadius(11).backgroundColor(warning ? this.colors.warningSurface : this.colors.tint)
+    .accessibilityLevel('no')
   }
 
   @Builder
   connectionError() {
     if (this.errorText) {
-      Text(this.errorText).fontFamily(APP_FONT).fontColor(ERROR).fontSize(14)
-        .width('100%').copyOption(CopyOptions.LocalDevice)
+      Text(this.errorText).fontColor(this.colors.error).fontSize(14).width('100%')
+        .padding(12).borderRadius(12).backgroundColor(this.colors.surface).copyOption(CopyOptions.LocalDevice)
+    }
+  }
+
+  @Builder
+  appBar() {
+    Row({ space: 8 }) {
+      Text('>_').fontFamily(APP_FONT).fontSize(15).fontWeight(FontWeight.Bold).fontColor(Color.White)
+        .textAlign(TextAlign.Center).width(30).height(30).borderRadius(10)
+        .linearGradient({ angle: 135, colors: [[this.colors.palette.ink, 0], [this.colors.palette.action, 1]] })
+      Text('Nerve').fontSize(20).fontWeight(FontWeight.Bold).fontColor(this.colors.foreground).layoutWeight(1)
+      this.iconButton($r('sys.symbol.bell'), this.pushLink ? '通知，有关联会话' : '通知',
+        () => this.showUtility('notifications'))
+      this.iconButton($r('sys.symbol.gearshape'), '设置', () => this.showUtility('settings'))
+    }.width('100%').constraintSize({ maxWidth: 540 }).padding({ left: 20, right: 12 })
+  }
+
+  @Builder
+  continuationCard(server: SavedSshServer, openedAt: number) {
+    Stack({ alignContent: Alignment.TopEnd }) {
+      Text('>_').fontFamily(APP_FONT).fontSize(30).fontColor('#dbffffff').textAlign(TextAlign.Center)
+        .width(87).height(72).borderRadius(18).border({ width: 1, color: '#65ffffff' })
+        .backgroundColor('#1affffff').rotate({ angle: -18 }).margin({ top: 24, right: 17 }).accessibilityLevel('no')
+      Column({ space: 6 }) {
+        Text('上次连接 · ' + this.relativeTime(openedAt)).fontSize(12).fontColor('#eef0ff')
+        Text(server.zellijSession || 'Shell').fontFamily(APP_FONT).fontSize(28).fontWeight(FontWeight.Bold)
+          .fontColor(Color.White).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(this.hostLabel(server) + (server.useMosh ? ' · Mosh' : ' · SSH')).fontSize(13).fontColor('#f4f3ff')
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Button('继续会话  →', { type: ButtonType.Normal }).fontSize(14).fontWeight(FontWeight.Bold).height(44)
+          .fontColor(this.colors.palette.deep).backgroundColor(Color.White).borderRadius(12).margin({ top: 8 })
+          .onClick(() => this.useSavedServer(server.id, false))
+      }.width('100%').alignItems(HorizontalAlign.Start).padding(18)
+    }.width('100%').constraintSize({ minHeight: 172 }).borderRadius(23).clip(true)
+    .linearGradient({ angle: 128, colors: [[this.colors.palette.deep, 0], [this.colors.palette.action, 0.72],
+      [this.colors.palette.ink, 1]] })
+  }
+
+  @Builder
+  recentRow(server: SavedSshServer, openedAt: number) {
+    Button({ type: ButtonType.Normal }) {
+      Row({ space: 9 }) {
+        this.tile('>_')
+        Column({ space: 4 }) {
+          Text(server.zellijSession || 'Shell').fontFamily(APP_FONT).fontSize(15).fontWeight(FontWeight.Bold)
+            .fontColor(this.colors.foreground).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(this.hostLabel(server) + (server.useMosh ? ' · Mosh' : ' · SSH')).fontSize(12).fontColor(this.colors.muted)
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+        Text(this.relativeTime(openedAt)).fontSize(12).fontColor(this.colors.muted)
+        Text('›').fontSize(21).fontColor(this.colors.muted)
+      }.width('100%').padding({ left: 10, right: 11, top: 7, bottom: 7 }).constraintSize({ minHeight: 58 })
+    }.width('100%').backgroundColor(Color.Transparent).borderRadius(0).padding(0)
+    .onClick(() => this.useSavedServer(server.id, false))
+  }
+
+  @Builder
+  emptySessions() {
+    Column({ space: 9 }) {
+      this.tile('>_')
+      Text('暂无最近会话').fontSize(17).fontWeight(FontWeight.Bold).fontColor(this.colors.foreground)
+      Text(this.savedServers.length ? '连接一台主机后，可以在这里继续会话。' : '添加开发机，连接已有 Zellij 会话或 Shell。')
+        .fontSize(13).fontColor(this.colors.muted).textAlign(TextAlign.Center)
+      Button(this.savedServers.length ? '查看主机' : '添加主机', { type: ButtonType.Normal })
+        .height(44).borderRadius(12).fontSize(14).fontColor(Color.White).backgroundColor(this.colors.palette.action)
+        .margin({ top: 3 }).onClick(() => {
+          if (this.savedServers.length) this.changeTab(1);
+          else this.addHost();
+        })
+    }.width('100%').padding(22).backgroundColor(this.colors.surface)
+    .border({ width: 1, color: this.colors.line }).borderRadius(19)
+  }
+
+  @Builder
+  notificationEntry() {
+    Button({ type: ButtonType.Normal }) {
+      Row({ space: 9 }) {
+        this.tile($r('sys.symbol.bell'), true)
+        Column({ space: 3 }) {
+          Text('会话通知').fontSize(14).fontWeight(FontWeight.Bold).fontColor(this.colors.foreground)
+          Text(this.notificationServer ? this.hostLabel(this.notificationServer) : '选择发送通知的主机')
+            .fontSize(12).fontColor(this.colors.muted).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+        Text('›').fontSize(21).fontColor(this.colors.muted)
+      }.padding(10).width('100%').constraintSize({ minHeight: 58 })
+    }.padding(0).width('100%').borderRadius(16).backgroundColor(this.colors.surface)
+    .border({ width: 1, color: this.colors.line }).onClick(() => this.showUtility('notifications'))
+  }
+
+  @Builder
+  storeStatus() {
+    if (this.serverListUnavailable) {
+      Row({ space: 12 }) {
+        Text('暂时无法读取已保存的主机').fontSize(14).fontColor(this.colors.error).layoutWeight(1)
+        Button('重试').height(44).backgroundColor(this.colors.tint).fontColor(this.colors.accent)
+          .enabled(!this.managingServers).onClick(() => this.loadSavedServers())
+      }.width('100%')
+    } else if (this.managingServers && !this.savedServers.length) {
+      Text('正在读取主机…').fontSize(14).fontColor(this.colors.muted)
+    }
+  }
+
+  @Builder
+  sessionHome() {
+    Text('会话').fontSize(34).fontWeight(FontWeight.Bold).fontColor(this.colors.foreground)
+      .width('100%').margin({ bottom: 3 })
+    this.storeStatus()
+    if (this.availableRecents().length) {
+      ForEach(this.availableRecents().slice(0, 1), (item: RecentSession) => {
+        this.continuationCard(this.serverById(item.serverId), item.openedAt)
+      }, (item: RecentSession): string => item.serverId + ':' + item.openedAt)
+    } else if (!this.managingServers && !this.serverListUnavailable) {
+      this.emptySessions()
+    }
+    if (this.pushLink) this.notificationEntry()
+    if (this.availableRecents().length > 1) {
+      this.sectionLabel('最近会话')
+      Column() {
+        ForEach(this.availableRecents().slice(1), (item: RecentSession, index: number) => {
+          if (index > 0) Divider().color(this.colors.line).margin({ left: 53 })
+          this.recentRow(this.serverById(item.serverId), item.openedAt)
+        }, (item: RecentSession): string => item.serverId + ':' + item.openedAt)
+      }.width('100%').borderRadius(17).clip(true).backgroundColor(this.colors.surface)
+      .border({ width: 1, color: this.colors.line })
     }
   }
 
   @Builder
   savedServerRow(server: SavedSshServer) {
-    Row({ space: 8 }) {
-      Column({ space: 4 }) {
-        Text(server.alias || this.knownHostId(server.host, server.port))
-          .fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
-          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          // 固定端口优先显示，较长的账号和会话名仍可在后方省略。
-          Text(server.useMosh && !server.p2pEndpoint && server.moshPort > 0 ?
-            'Mosh · UDP ' + server.moshPort + ' · ' + server.username +
-            (server.zellijSession ? ' · ' + server.zellijSession : '') :
-            server.username + (server.zellijSession ? ' · ' + server.zellijSession : '') +
-            (server.useMosh ? ' · Mosh' : ' · SSH'))
-          .fontFamily(APP_FONT).fontSize(12).fontColor(MUTED)
-          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-      Button('编辑', { type: ButtonType.Normal })
-        .height(40).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
-        .fontColor(FOREGROUND).backgroundColor(BACKGROUND)
-        .onClick(() => this.useSavedServer(server.id, true))
-      Button('连接', { type: ButtonType.Normal })
-        .height(40).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
-        .fontColor(BACKGROUND).backgroundColor(ACCENT)
-        .onClick(() => this.useSavedServer(server.id, false))
-    }.width('100%').padding(12).borderRadius(10).backgroundColor(SURFACE)
+    Row() {
+      Button({ type: ButtonType.Normal }) {
+        Row({ space: 9 }) {
+          this.tile($r('sys.symbol.computer'))
+          Column({ space: 4 }) {
+            Text(this.hostLabel(server)).fontSize(15).fontWeight(FontWeight.Medium).fontColor(this.colors.foreground)
+              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+            // 固定端口优先显示，主机地址过长时仍能核对 Mosh 端口。
+            Text(server.useMosh && !server.p2pEndpoint && server.moshPort > 0 ?
+              'Mosh · UDP ' + server.moshPort + ' · ' + this.knownHostId(server.host, server.port) :
+              (server.p2pEndpoint ? 'P2P 直连' : this.knownHostId(server.host, server.port)) +
+              (server.useMosh ? ' · Mosh' : ' · SSH'))
+              .fontSize(12).fontColor(this.colors.muted).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+        }.width('100%').padding({ left: 10, top: 8, bottom: 8 }).constraintSize({ minHeight: 58 })
+      }.layoutWeight(1).padding(0).borderRadius(0).backgroundColor(Color.Transparent)
+      .onClick(() => this.useSavedServer(server.id, false))
+      if (!this.pickingNotificationHost) {
+        this.iconButton('⋯', '编辑 ' + this.hostLabel(server), () => this.useSavedServer(server.id, true))
+      }
+    }.width('100%').padding({ right: 4 })
   }
 
   @Builder
-  savedServerList() {
-    Row({ space: 8 }) {
-      Text('主机列表').layoutWeight(1).fontFamily(APP_FONT).fontSize(20)
-        .fontWeight(FontWeight.Medium).fontColor(FOREGROUND)
-      Button('添加服务器', { type: ButtonType.Normal })
-        .height(40).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
-        .fontColor(BACKGROUND).backgroundColor(ACCENT)
-        .onClick(() => this.setServerEditor(true))
-    }.width('100%')
-    this.connectionError()
-    if (this.checkingHostKey) {
-      Text('正在核对主机').fontFamily(APP_FONT).fontColor(MUTED).fontSize(14)
-    }
-    if (this.serverListUnavailable) {
+  hostHome() {
+    Row() {
+      Text('主机').fontSize(34).fontWeight(FontWeight.Bold).fontColor(this.colors.foreground).layoutWeight(1)
+      Button('＋ 添加主机', { type: ButtonType.Normal }).height(44).borderRadius(12).fontSize(14)
+        .fontColor(Color.White).backgroundColor(this.colors.palette.action).onClick(() => this.addHost())
+    }.width('100%').margin({ bottom: 3 })
+    this.storeStatus()
+    if (this.pickingNotificationHost) {
       Row({ space: 8 }) {
-        Text('暂时无法读取已保存的服务器').layoutWeight(1)
-          .fontFamily(APP_FONT).fontColor(ERROR).fontSize(13)
-        Button('重试', { type: ButtonType.Normal })
-          .height(36).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
-          .fontColor(FOREGROUND).backgroundColor(SURFACE)
-          .onClick(() => this.loadSavedServers())
-      }.width('100%')
-    } else if (this.savedServers.length === 0) {
-      Text(this.managingServers ? '正在读取主机…' : '暂无已保存的服务器')
-        .width('100%').padding({ top: 28, bottom: 28 }).borderRadius(10)
-        .fontFamily(APP_FONT).fontSize(14).fontColor(MUTED).textAlign(TextAlign.Center)
-        .backgroundColor(SURFACE)
+        Text('选择发送通知的主机').fontSize(14).fontColor(this.colors.warning).layoutWeight(1)
+        Button('取消').height(44).fontColor(this.colors.warning).backgroundColor(Color.Transparent)
+          .onClick(() => { this.pickingNotificationHost = false; })
+      }.width('100%').padding({ left: 10, right: 6 }).backgroundColor(this.colors.warningSurface).borderRadius(13)
+    } else if (this.pushLink) {
+      this.notificationEntry()
     }
-    ForEach(this.savedServers, (server: SavedSshServer) => {
-      this.savedServerRow(server)
-    }, (server: SavedSshServer): string => String(server.id))
+    if (this.savedServers.length) {
+      this.sectionLabel('已保存的主机')
+      Column() {
+        ForEach(this.savedServers, (server: SavedSshServer, index: number) => {
+          if (index > 0) Divider().color(this.colors.line).margin({ left: 53 })
+          this.savedServerRow(server)
+        }, (server: SavedSshServer): string =>
+          server.id + ':' + server.alias + ':' + server.host + ':' + server.port + ':' + server.useMosh)
+      }.width('100%').borderRadius(17).clip(true).backgroundColor(this.colors.surface)
+      .border({ width: 1, color: this.colors.line })
+    } else if (!this.managingServers && !this.serverListUnavailable) {
+      Text('暂无已保存的主机').fontSize(14).fontColor(this.colors.muted).width('100%').padding(20)
+        .textAlign(TextAlign.Center).backgroundColor(this.colors.surface).borderRadius(17)
+    }
+  }
+
+  // 底部导航仅高亮图标和文字，完整按钮区域仍可点击。
+  @Builder
+  bottomTab(index: number, label: string, mark: Resource | string) {
+    Button({ type: ButtonType.Normal }) {
+      Column({ space: 1 }) {
+        Stack() {
+          if (typeof mark === 'string') {
+            Text(mark).fontFamily(APP_FONT).fontSize(15)
+              .fontColor(this.activeTab === index ? this.colors.accent : this.colors.muted)
+          } else {
+            SymbolGlyph(mark).fontSize(18).fontColor([this.activeTab === index ? this.colors.accent : this.colors.muted])
+          }
+        }.width(44).height(24)
+        Text(label).fontSize(12).fontWeight(this.activeTab === index ? FontWeight.Bold : FontWeight.Medium)
+          .fontColor(this.activeTab === index ? this.colors.accent : this.colors.muted)
+      }.height(49).justifyContent(FlexAlign.Center).width('100%')
+    }.layoutWeight(1).padding(0).backgroundColor(Color.Transparent).borderRadius(12).accessibilityText(label)
+    .accessibilitySelected(this.activeTab === index).onClick(() => this.changeTab(index))
+  }
+
+  @Builder
+  home() {
+    Column() {
+      this.appBar()
+      Scroll() {
+        Column({ space: 11 }) {
+          if (this.activeTab === 0) this.sessionHome()
+          else this.hostHome()
+          if (this.checkingHostKey) {
+            Text('正在核对主机…').fontSize(14).fontColor(this.colors.muted)
+          }
+          this.connectionError()
+        }.width('100%').constraintSize({ maxWidth: 540 }).padding({ left: 20, right: 20, top: 16, bottom: 20 })
+        .alignItems(HorizontalAlign.Start)
+      }.width('100%').layoutWeight(1).align(Alignment.Top).enabled(!this.checkingHostKey && !this.managingServers)
+      Divider().color(this.colors.line)
+      Row({ space: 8 }) {
+        this.bottomTab(0, '会话', '>_')
+        this.bottomTab(1, '主机', $r('sys.symbol.computer'))
+      }.width('100%').constraintSize({ maxWidth: 540 }).padding({ left: 24, right: 24, top: 4, bottom: 4 })
+    }.width('100%').height('100%')
   }
 
   @Builder
   serverFields() {
+    Row({ space: 4 }) {
+      this.optionButton({ label: '手动连接', selected: !this.pairedConnection,
+        onSelect: () => this.usePairedConnection(false) })
+      this.optionButton({ label: '配对连接', selected: this.pairedConnection,
+        onSelect: () => this.usePairedConnection(true) })
+    }.width('100%').padding(4).borderRadius(14).backgroundColor(this.colors.line)
+    this.sectionLabel('连接')
     this.field('名称（可选）', this.serverAlias, '例如 我的 WSL', InputType.Normal, 128,
       (value: string) => { this.serverAlias = value; })
-    this.field('P2P 配对地址（可选）', this.p2pCode, '粘贴 nerve pair 的输出', InputType.Password, 512,
-      (value: string) => { this.p2pCode = value; })
-    if (!this.p2pCode.trim()) {
-      this.field('主机地址', this.host, '例如 dev.example.local', InputType.Normal, 253,
-        (value: string) => { this.host = value; })
-    }
-    Row({ space: 10 }) {
-      Column() {
-        this.field('用户名', this.username, 'SSH 用户', InputType.Normal, 128,
-          (value: string) => { this.username = value; })
-      }.layoutWeight(2)
-      if (!this.p2pCode.trim()) {
+    if (this.pairedConnection) {
+      this.field('P2P 配对地址', this.p2pCode, '粘贴 nerve pair 的输出', InputType.Password, 512,
+        (value: string) => { this.p2pCode = value; })
+    } else {
+      Row({ space: 9 }) {
         Column() {
-          this.field('SSH 端口', this.port, '22', InputType.Number, 5,
-            (value: string) => { this.port = value; })
+          this.field('主机地址', this.host, 'dev.example.local', InputType.Normal, 253,
+            (value: string) => { this.host = value; })
+        }.layoutWeight(2)
+        Column() {
+          this.field('端口', this.port, '22', InputType.Number, 5, (value: string) => { this.port = value; })
         }.layoutWeight(1)
-      }
-    }.width('100%')
-    this.field('Zellij 会话', this.zellijSession, '可选 · 留空打开 Shell', InputType.Normal, 128,
+      }.width('100%')
+    }
+    this.field('用户名', this.username, 'SSH 用户', InputType.Normal, 128,
+      (value: string) => { this.username = value; })
+    this.field('默认 Zellij 会话', this.zellijSession, '留空打开 Shell', InputType.Normal, 128,
       (value: string) => { this.zellijSession = value; })
-    Row({ space: 8 }) {
+    Text('传输协议').fontSize(13).fontColor(this.colors.muted)
+    Row({ space: 4 }) {
       this.optionButton({ label: 'SSH', selected: !this.useMosh, onSelect: () => { this.useMosh = false; } })
       this.optionButton({ label: 'Mosh', selected: this.useMosh, onSelect: () => { this.useMosh = true; } })
-    }.width('100%')
-    if (this.useMosh && !this.p2pCode.trim()) {
-        this.field('Mosh UDP 端口', this.moshPortInput, '填写固定端口 · 留空自动分配', InputType.Number, 5,
-        (value: string) => { this.moshPortInput = value; })
-    }
-    Row({ space: 8 }) {
+    }.width('100%').padding(4).borderRadius(14).backgroundColor(this.colors.line)
+    this.sectionLabel('身份验证')
+    Row({ space: 4 }) {
       this.optionButton({ label: '密码', selected: !this.usePrivateKey, onSelect: () => this.changeAuth(false) })
       this.optionButton({ label: '私钥', selected: this.usePrivateKey, onSelect: () => this.changeAuth(true) })
-    }.width('100%')
+    }.width('100%').padding(4).borderRadius(14).backgroundColor(this.colors.line)
     if (this.usePrivateKey) {
-      Button(this.keySelected ? '已选私钥 · 更换' : this.canKeepSavedCredentials() ? '已保存私钥 · 更换' : '选择私钥文件',
-        { type: ButtonType.Normal })
-        .width('100%').height(44).borderRadius(10).fontFamily(APP_FONT)
-        .fontColor(FOREGROUND).backgroundColor(SURFACE)
-        .onClick(() => { this.selectKey(); })
+      Button(this.keySelected ? '已选私钥 · 更换' :
+        this.canKeepSavedCredentials() ? '已保存私钥 · 更换' : '选择私钥文件', { type: ButtonType.Normal })
+        .width('100%').height(44).borderRadius(12).fontSize(14)
+        .fontColor(this.colors.accent).backgroundColor(this.colors.tint).onClick(() => this.selectKey())
       if (this.keySelected || !this.canKeepSavedCredentials()) {
         this.field('私钥口令', this.passphrase, '未加密时留空', InputType.Password, 1024,
           (value: string) => { this.passphrase = value; })
@@ -1314,110 +1725,146 @@ struct Index {
       this.field('SSH 密码', this.password, this.canKeepSavedCredentials() ? '留空保留已保存密码' : '输入密码',
         InputType.Password, 1024, (value: string) => { this.password = value; })
     }
-    this.connectionError()
-    Row({ space: 10 }) {
-      Button(this.editingServer ? '保存修改' : '保存服务器', { type: ButtonType.Normal })
-        .layoutWeight(1).height(48).borderRadius(10).fontFamily(APP_FONT).fontSize(16)
-        .fontColor(this.editingServer ? BACKGROUND : FOREGROUND)
-        .backgroundColor(this.editingServer ? ACCENT : SURFACE)
-        .onClick(() => this.saveServer())
-      if (this.editingServer) {
-        Button('删除服务器', { type: ButtonType.Normal })
-          .layoutWeight(1).height(48).borderRadius(10).fontFamily(APP_FONT).fontSize(16)
-          .fontColor(ERROR).backgroundColor(SURFACE)
-          .onClick(() => this.removeServer())
-      } else {
-        Button(this.checkingHostKey ? '正在核对主机' :
-          this.pushLink && !this.notificationServer ? '连接并打开会话' : '连接',
-          { type: ButtonType.Normal })
-          .layoutWeight(1).height(48).borderRadius(10).fontFamily(APP_FONT).fontSize(16)
-          .fontWeight(FontWeight.Medium).fontColor(BACKGROUND).backgroundColor(ACCENT)
-          .onClick(() => this.startConnection(undefined, this.notificationServer ? '' : this.pushLink))
+    if (this.useMosh && !this.pairedConnection) {
+      Button(this.advancedConnection ? '收起高级选项  −' : '高级选项  ＋', { type: ButtonType.Normal })
+        .height(44).borderRadius(12).backgroundColor(this.colors.surface).fontColor(this.colors.foreground)
+        .onClick(() => { this.advancedConnection = !this.advancedConnection; })
+      if (this.advancedConnection) {
+        this.field('Mosh UDP 端口', this.moshPortInput, '填写固定端口 · 留空自动分配', InputType.Number, 5,
+          (value: string) => { this.moshPortInput = value; })
       }
-    }.width('100%')
-  }
-
-  @Builder
-  notificationCard() {
-    Column({ space: 10 }) {
-      Row({ space: 10 }) {
-        Column({ space: 4 }) {
-          Text('通知关联会话').fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
-          if (this.notificationServer) {
-            Text(this.notificationServer.username + '@' +
-              this.knownHostId(this.notificationServer.host, this.notificationServer.port))
-              .fontFamily(APP_FONT).fontSize(13).fontColor(MUTED).wordBreak(WordBreak.BREAK_ALL)
-          } else if (this.serverEditorOpen && !this.editingServer) {
-            Text('填写发送通知的开发机信息后连接').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
-          } else if (this.savedServers.length === 0) {
-            Text('点「添加服务器」填写开发机信息').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
-          } else {
-            Text('选择发送通知的开发机').fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
-          }
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Button('取消', { type: ButtonType.Normal })
-          .fontFamily(APP_FONT).fontSize(13).fontColor(FOREGROUND).backgroundColor(BACKGROUND)
-          .borderRadius(8).height(34)
-          .onClick(() => { AppStorage.set<string>('nervePushLink', ''); })
-      }.width('100%')
-      if (this.notificationServer) {
-        Button('打开会话', { type: ButtonType.Normal })
-          .width('100%').height(44).borderRadius(8).fontFamily(APP_FONT).fontSize(15)
-          .fontColor(BACKGROUND).backgroundColor(ACCENT)
-          .onClick(() => this.openMatchedNotification())
-      }
-    }.width('100%').padding(12).borderRadius(10).backgroundColor(SURFACE)
-  }
-
-  @Builder
-  serversPage() {
-    Scroll() {
-      Column({ space: 14 }) {
-        Row({ space: 12 }) {
-          if (!this.serverEditorOpen) {
-            Text('>_').width(44).height(42).borderRadius(10).backgroundColor(SURFACE)
-              .fontSize(18).fontFamily(APP_FONT).fontColor(ACCENT).textAlign(TextAlign.Center)
-          }
-          Text(this.serverEditorOpen ? (this.editingServer ? '编辑服务器' : '添加服务器') : 'Nerve')
-            .layoutWeight(1).fontFamily(APP_FONT).fontSize(25).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
-          Button(this.serverEditorOpen ? '返回' : '推送通知', { type: ButtonType.Normal })
-            .fontFamily(APP_FONT).fontSize(13).fontColor(FOREGROUND).backgroundColor(SURFACE)
-            .borderRadius(8).height(36)
-            .onClick(() => {
-              if (this.serverEditorOpen) {
-                this.setServerEditor(false);
-              } else {
-                this.pushSettingsVisible = true;
-              }
-            })
-        }.width('100%').margin({ bottom: 8 })
-        if (this.pushLink) {
-          this.notificationCard()
-        }
-        if (this.serverEditorOpen) {
-          this.serverFields()
-        } else {
-          this.savedServerList()
-        }
-      }
-      .padding({ left: 20, top: 18, right: 20, bottom: 28 })
-      .alignItems(HorizontalAlign.Start)
-      .constraintSize({ maxWidth: 540 })
-      .width('100%')
-      .enabled(!this.checkingHostKey && !this.managingServers)
     }
-    .width('100%')
-    .height('100%')
-    .align(Alignment.Top)
+    this.connectionError()
+    Row({ space: 8 }) {
+      this.actionButton(this.editingServer ? '保存修改' : '保存主机', () => { this.saveServer(); }, !!this.editingServer)
+      if (!this.editingServer) {
+        this.actionButton(this.checkingHostKey ? '正在核对主机' : this.pickingNotificationHost ? '连接并打开会话' : '连接',
+          () => this.startConnection(undefined, this.pickingNotificationHost ? this.pushLink : ''))
+      }
+    }.width('100%').margin({ top: 4 })
+    if (this.editingServer) {
+      Button('删除主机', { type: ButtonType.Normal }).width('100%').height(44)
+        .fontSize(14).fontColor(this.colors.error).backgroundColor(Color.Transparent).onClick(() => this.removeServer())
+    }
+  }
+
+  @Builder
+  editor() {
+    Column() {
+      Row({ space: 4 }) {
+        this.iconButton('‹', '返回', () => this.setServerEditor(false))
+        Text(this.editingServer ? '编辑主机' : '添加主机').fontSize(18).fontWeight(FontWeight.Bold)
+          .fontColor(this.colors.foreground)
+      }.width('100%').constraintSize({ maxWidth: 540 }).padding({ left: 8 })
+      Scroll() {
+        Column({ space: 10 }) {
+          this.serverFields()
+        }.width('100%').constraintSize({ maxWidth: 540 }).padding({ left: 20, right: 20, top: 8, bottom: 20 })
+        .alignItems(HorizontalAlign.Start)
+      }.width('100%').layoutWeight(1).align(Alignment.Top).enabled(!this.checkingHostKey && !this.managingServers)
+    }.width('100%').height('100%')
+  }
+
+  @Builder
+  paletteOption(palette: ThemePalette) {
+    Button({ type: ButtonType.Normal }) {
+      Row({ space: 8 }) {
+        Stack().width(30).height(30).borderRadius(9)
+          .linearGradient({ angle: 140, colors: [[palette.deep, 0], [palette.action, 0.62], [palette.glow, 1]] })
+        Text(palette.name).fontSize(14).fontWeight(FontWeight.Medium).fontColor(this.colors.foreground).layoutWeight(1)
+        if (this.colors.palette.id === palette.id) {
+          Text('✓').fontSize(15).fontColor(this.colors.accent)
+        }
+      }.width('100%').padding(8)
+    }.layoutWeight(1).height(52).padding(0).borderRadius(12)
+    .backgroundColor(this.colors.palette.id === palette.id ? this.colors.tint : this.colors.surface)
+    .border({ width: 1, color: this.colors.palette.id === palette.id ? this.colors.accent : this.colors.line })
+    .accessibilityText(palette.name).accessibilitySelected(this.colors.palette.id === palette.id)
+    .onClick(() => this.changeAppearance(palette.id, this.darkAppearance))
+  }
+
+  @Builder
+  appearanceSettings() {
+    this.sectionLabel('外观')
+    Row({ space: 4 }) {
+      this.optionButton({ label: '浅色', selected: !this.darkAppearance,
+        onSelect: () => this.changeAppearance(this.colors.palette.id, false) })
+      this.optionButton({ label: '深色', selected: this.darkAppearance,
+        onSelect: () => this.changeAppearance(this.colors.palette.id, true) })
+    }.width('100%').padding(4).borderRadius(14).backgroundColor(this.colors.line)
+    this.sectionLabel('主题色')
+    Row({ space: 8 }) {
+      this.paletteOption(PALETTES[0])
+      this.paletteOption(PALETTES[1])
+    }.width('100%')
+    Row({ space: 8 }) {
+      this.paletteOption(PALETTES[2])
+      this.paletteOption(PALETTES[3])
+    }.width('100%')
+    if (this.preferenceError) {
+      Text(this.preferenceError).fontSize(13).fontColor(this.colors.error).width('100%')
+    }
+    Button('推送通知设置  ›', { type: ButtonType.Normal }).width('100%').height(48).borderRadius(12)
+      .fontSize(14).fontColor(this.colors.foreground).backgroundColor(this.colors.surface)
+      .border({ width: 1, color: this.colors.line }).margin({ top: 4 }).onClick(() => {
+        this.utilityVisible = false;
+        this.pushSettingsVisible = true;
+      })
+  }
+
+  @Builder
+  notificationSettings() {
+    if (this.pushLink) {
+      Text(this.notificationServer ? this.hostLabel(this.notificationServer) : '请选择发送通知的主机。')
+        .fontSize(14).fontColor(this.colors.muted)
+      Row({ space: 8 }) {
+        this.actionButton('清除通知', () => {
+          AppStorage.set<string>('nervePushLink', '');
+          this.utilityVisible = false;
+        }, false)
+        if (!this.terminalVisible || this.pushLink !== this.openedPushLink) {
+          this.actionButton(this.notificationServer ? '打开会话' : '选择主机', () => {
+            if (this.notificationServer) this.openMatchedNotification();
+            else this.chooseNotificationHost();
+          })
+        }
+      }.width('100%').enabled(!this.managingServers && !this.checkingHostKey && !this.closingMosh)
+    } else {
+      Text('暂无会话通知').fontSize(14).fontColor(this.colors.muted)
+    }
+  }
+
+  @Builder
+  utilitySheet() {
+    Column({ space: 8 }) {
+      Row() {
+        Text(this.utilityPage === 'settings' ? '设置' : this.utilityPage === 'notifications' ? '通知' : '终端操作')
+          .layoutWeight(1).fontSize(21).fontWeight(FontWeight.Bold).fontColor(this.colors.foreground)
+        this.iconButton('×', '关闭', () => { this.utilityVisible = false; })
+      }.width('100%')
+      if (this.utilityPage === 'settings') {
+        this.appearanceSettings()
+      } else if (this.utilityPage === 'notifications') {
+        this.notificationSettings()
+      } else {
+        Button(this.terminalEnded ? '返回' : '断开并返回', { type: ButtonType.Normal }).width('100%').height(44)
+          .fontColor(this.colors.error).backgroundColor(this.colors.warningSurface).borderRadius(12)
+          .enabled(!this.closingMosh).onClick(() => {
+            this.utilityVisible = false;
+            this.closeTerminal(() => this.backToForm());
+          })
+      }
+    }.width('100%').padding({ left: 20, right: 20, top: 8, bottom: 20 }).alignItems(HorizontalAlign.Start)
+    .backgroundColor(this.colors.surface)
   }
 
   @Builder
   hostKeyFingerprint(label: string, value: string) {
     Column({ space: 6 }) {
-      Text(label).fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
-      Text(value).fontFamily(APP_FONT).fontSize(14).fontColor(FOREGROUND)
+      Text(label).fontFamily(APP_FONT).fontSize(13).fontColor(this.colors.muted)
+      Text(value).fontFamily(APP_FONT).fontSize(14).fontColor(this.colors.foreground)
         .wordBreak(WordBreak.BREAK_ALL).copyOption(CopyOptions.LocalDevice)
-    }.width('100%').alignItems(HorizontalAlign.Start).padding(12).borderRadius(10).backgroundColor(SURFACE)
+    }.width('100%').alignItems(HorizontalAlign.Start).padding(12).borderRadius(10).backgroundColor(this.colors.surface)
   }
 
   @Builder
@@ -1426,29 +1873,29 @@ struct Index {
       Column({ space: 14 }) {
         Text(review.previous ? 'SSH 主机密钥已变化' : '首次连接此主机')
           .fontFamily(APP_FONT).fontSize(24).fontWeight(FontWeight.Bold)
-          .fontColor(review.previous ? ERROR : FOREGROUND)
-        Text(this.knownHostId(review.host, review.port)).fontFamily(APP_FONT).fontSize(15).fontColor(FOREGROUND)
+          .fontColor(review.previous ? this.colors.error : this.colors.foreground)
+        Text(this.knownHostId(review.host, review.port)).fontFamily(APP_FONT).fontSize(15).fontColor(this.colors.foreground)
           .wordBreak(WordBreak.BREAK_ALL)
         Text(review.previous ?
           '连接已阻止。请在开发机或可信渠道核对新指纹。' + (review.reconnect ? '' : '更新信任后，需要重新填写 SSH 凭据。') :
           '请确认这是你的开发机。确认后，Nerve 会在此设备记住它的主机密钥。')
-          .fontFamily(APP_FONT).fontSize(14).fontColor(MUTED)
+          .fontFamily(APP_FONT).fontSize(14).fontColor(this.colors.muted)
         if (review.previous) {
           this.hostKeyFingerprint('已保存的指纹', review.previous)
         }
         this.hostKeyFingerprint(review.previous ? '新指纹' : '主机指纹', review.observed)
         if (this.errorText) {
-          Text(this.errorText).fontFamily(APP_FONT).fontSize(14).fontColor(ERROR)
+          Text(this.errorText).fontFamily(APP_FONT).fontSize(14).fontColor(this.colors.error)
         }
         Row({ space: 10 }) {
           Button('取消', { type: ButtonType.Normal })
             .layoutWeight(1).height(44).borderRadius(10).fontFamily(APP_FONT).fontSize(15)
-            .fontColor(FOREGROUND).backgroundColor(SURFACE)
+            .fontColor(this.colors.foreground).backgroundColor(this.colors.surface)
             .onClick(() => this.cancelHostKeyReview())
           Button(review.previous ? review.reconnect ? '更新并连接' : '更新信任' : '信任并连接',
             { type: ButtonType.Normal })
             .layoutWeight(1).height(44).borderRadius(10).fontFamily(APP_FONT).fontSize(15)
-            .fontColor(BACKGROUND).backgroundColor(ACCENT)
+            .fontColor(Color.White).backgroundColor(this.colors.palette.action)
             .onClick(() => this.confirmHostKey())
         }.width('100%').enabled(!this.checkingHostKey)
       }
@@ -1457,6 +1904,47 @@ struct Index {
       .padding({ left: 20, top: 24, right: 20, bottom: 28 })
       .alignItems(HorizontalAlign.Start)
     }.width('100%').height('100%').align(Alignment.Top)
+  }
+
+  @Builder
+  formatKey(label: string, name: string, description: string) {
+    Button(label, { type: ButtonType.Normal }).layoutWeight(1).padding(0).height(44).borderRadius(9)
+      .fontFamily(APP_FONT).fontSize(14).fontColor(TERMINAL_TEXT).backgroundColor(TERMINAL_SURFACE)
+      .accessibilityText(description).focusOnTouch(false).enabled(this.connected)
+      .onClick(() => this.runTerminalScript('window.nerveTerminal.key(' + JSON.stringify(name) + ')'))
+  }
+
+  @Builder
+  terminalToolbar() {
+    Column() {
+      Row() {
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 7 }) {
+            SymbolGlyph($r('sys.symbol.keyboard')).fontSize(19).fontColor([TERMINAL_TEXT])
+            Text(this.terminalKeysVisible ? '收起键盘' : '打开键盘').fontSize(13).fontColor(TERMINAL_TEXT)
+          }.padding({ left: 9, right: 9 })
+        }.height(44).padding(0).borderRadius(10).backgroundColor(Color.Transparent).focusOnTouch(false)
+        .enabled(this.connected).onClick(() => this.toggleTerminalKeyboard())
+      }.width('100%').padding({ left: 4 })
+      if (this.terminalKeysVisible) {
+        Row({ space: 3 }) {
+          Button('Ctrl', { type: ButtonType.Normal }).layoutWeight(1).padding(0).height(44).borderRadius(9)
+            .fontFamily(APP_FONT).fontSize(13).fontColor(TERMINAL_TEXT)
+            .backgroundColor(this.ctrlArmed ? this.colors.palette.action : TERMINAL_SURFACE)
+            .accessibilitySelected(this.ctrlArmed).focusOnTouch(false).enabled(this.connected)
+            .onClick(() => {
+              this.ctrlArmed = !this.ctrlArmed;
+              this.runTerminalScript('window.nerveTerminal.focus()');
+            })
+          this.formatKey('Esc', 'escape', 'Escape 键')
+          this.formatKey('Tab', 'tab', 'Tab 键')
+          this.formatKey('←', 'left', '左方向键')
+          this.formatKey('↓', 'down', '下方向键')
+          this.formatKey('↑', 'up', '上方向键')
+          this.formatKey('→', 'right', '右方向键')
+        }.width('100%').padding({ left: 6, right: 6, bottom: 7 })
+      }
+    }.width('100%').backgroundColor(TERMINAL_TOOLBAR_BACKGROUND)
   }
 
   @Builder
@@ -1489,32 +1977,39 @@ struct Index {
   @Builder
   terminalView(instance: number) {
     Column() {
-      Row({ space: 10 }) {
-        Column({ space: 4 }) {
-          Text(this.openedRemoteTitle)
-            .fontFamily(APP_FONT).fontSize(17).fontWeight(FontWeight.Medium).fontColor(FOREGROUND).maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(this.statusText).fontFamily(APP_FONT).fontSize(12).fontColor(this.connected ? ACCENT : MUTED)
+      Row({ space: 4 }) {
+        this.iconButton('‹', '返回', () => this.closeTerminal(() => this.backToForm()), true)
+        Column({ space: 3 }) {
+          Text(this.openedRemoteTitle).fontFamily(APP_FONT).fontSize(16).fontWeight(FontWeight.Bold)
+            .fontColor(TERMINAL_TEXT).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(this.openedHostLabel + (this.terminalEnded ? '' : ' · ' + this.statusText)).fontSize(12)
+            .fontColor(this.terminalEnded ? '#ffcb80' :
+              this.statusText.includes('已连接') ? '#80deb3' : TERMINAL_MUTED)
+            .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
         }.layoutWeight(1).alignItems(HorizontalAlign.Start)
         if (this.pushLink && this.pushLink !== this.openedPushLink) {
-          Button(this.notificationServer ? '打开会话' : '查看通知', { type: ButtonType.Normal })
-            .height(34).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
-            .fontColor(BACKGROUND).backgroundColor(ACCENT)
-            .enabled(!this.managingServers && !this.closingMosh)
-            .onClick(() => {
-              if (this.notificationServer) {
-                this.openMatchedNotification();
-              } else {
-                this.closeTerminal(() => this.backToForm());
-              }
-            })
+          this.iconButton($r('sys.symbol.bell'), '查看通知', () => this.showUtility('notifications'), true)
         }
-        this.terminalMenuButton(ACCENT)
-      }.width('100%').padding({ left: 12, top: 8, right: 12, bottom: 8 })
+        this.terminalMenuButton(this.colors.palette.light)
+      }.width('100%').padding({ left: 4, right: 7, top: 3, bottom: 3 })
+      Divider().color('#2d3145')
+      if (this.terminalEnded || this.errorText) {
+        Row({ space: 8 }) {
+          Text(this.errorText || this.statusText).fontSize(13).fontColor('#ffcf91').layoutWeight(1)
+            .copyOption(CopyOptions.LocalDevice)
+          if (this.terminalEnded && this.terminalServerId > 0) {
+            Button('重新连接', { type: ButtonType.Normal }).height(44).borderRadius(10).fontSize(13)
+              .fontColor('#ffdaac').backgroundColor('#503722').enabled(!this.managingServers)
+              .onClick(() => this.reconnectTerminal())
+          }
+        }.width('100%').padding({ left: 12, right: 10, top: 5, bottom: 5 }).backgroundColor('#302623')
+      }
       Web({ src: $rawfile('terminal/index.html'), controller: this.view })
         .width('100%')
         .layoutWeight(1)
-        .backgroundColor('#0d1418')
+        .backgroundColor(TERMINAL_BACKGROUND)
+        .id('nerve-terminal')
+        .focusable(true)
         .javaScriptAccess(true)
         .fileAccess(false)
         .domStorageAccess(false)
@@ -1534,35 +2029,17 @@ struct Index {
             url !== TERMINAL_FILE_URL;
         })
         .onPageEnd(() => {
-          if (this.generation === instance) this.runTerminalScript('window.nerveTerminal.start()');
+          if (this.generation === instance) {
+            this.runTerminalScript('window.nerveTerminal.setCursor(' + JSON.stringify(this.colors.palette.light) +
+              ');window.nerveTerminal.start()');
+          }
         })
         .onRenderExited(() => {
           if (this.generation === instance) this.onTerminalError();
         })
-      if (this.errorText) {
-        Text(this.errorText).width('100%').fontFamily(APP_FONT).fontColor(ERROR).fontSize(13)
-          .padding({ left: 12, right: 12, top: 6 })
-      }
-      Row({ space: 5 }) {
-        Button('Ctrl', { type: ButtonType.Normal })
-          .layoutWeight(1).padding(0).height(38).borderRadius(8).fontSize(14)
-          .fontFamily(APP_FONT)
-          .fontColor(this.ctrlArmed ? BACKGROUND : FOREGROUND)
-          .backgroundColor(this.ctrlArmed ? ACCENT : SURFACE)
-          .focusOnTouch(false)
-          .enabled(this.connected)
-          .onClick(() => {
-            this.ctrlArmed = !this.ctrlArmed;
-            this.runTerminalScript('window.nerveTerminal.focus()');
-          })
-        this.formatKey('Esc', 'escape', 'Escape 键')
-        this.formatKey('Tab', 'tab', 'Tab 键')
-        this.formatKey('←', 'left', '左方向键')
-        this.formatKey('↓', 'down', '下方向键')
-        this.formatKey('↑', 'up', '上方向键')
-        this.formatKey('→', 'right', '右方向键')
-      }.padding({ left: 8, top: 6, right: 8, bottom: 8 }).width('100%')
-    }.width('100%').height('100%')
+      Divider().color('#2d3145')
+      this.terminalToolbar()
+    }.width('100%').height('100%').backgroundColor(TERMINAL_BACKGROUND)
   }
 
   build() {
@@ -1574,13 +2051,16 @@ struct Index {
       } else if (this.hostKeyReview) {
         this.reviewHostKey(this.hostKeyReview)
       } else if (this.pushSettingsVisible) {
-        PushSettings({ onClose: () => { this.pushSettingsVisible = false; } })
+        PushSettings({ colors: this.colors, onClose: () => { this.pushSettingsVisible = false; } })
+      } else if (this.serverEditorOpen) {
+        this.editor()
       } else {
-        this.serversPage()
+        this.home()
       }
     }
-    .width('100%')
-    .height('100%')
-    .backgroundColor(BACKGROUND)
+    .width('100%').height('100%')
+    .backgroundColor(this.terminalVisible ? TERMINAL_BACKGROUND : this.colors.background)
+    .bindSheet($$this.utilityVisible, this.utilitySheet(), { height: SheetSize.FIT_CONTENT,
+      dragBar: true, showClose: false, backgroundColor: this.colors.surface })
   }
 }

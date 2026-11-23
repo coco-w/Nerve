@@ -7,7 +7,7 @@ const terminal = new Terminal({
   fontSize: FONT_SIZE,
   scrollback: 1500,
   cursorBlink: true,
-  theme: { background: '#0d1418', foreground: '#e3eced', cursor: '#7ae0bb', selectionBackground: '#334e53' },
+  theme: { background: '#10131e', foreground: '#d5dbef', cursor: '#b6a9ff', selectionBackground: '#38415c' },
   // 远端内容可以显示超链接，点击不会导航或打开其他窗口。
   linkHandler: { activate() {} }
 });
@@ -72,6 +72,14 @@ window.nerveTerminal = {
   },
   focus() {
     terminal.focus();
+  },
+  // 收起软键盘时同步释放终端输入焦点。
+  blur() {
+    terminal.blur();
+  },
+  // 切换光标主题色时保留背景、文字和选区的配色。
+  setCursor(color) {
+    terminal.options.theme = { ...terminal.options.theme, cursor: color };
   },
   key(name) {
     if (!Object.hasOwn(keys, name) || !native) return;

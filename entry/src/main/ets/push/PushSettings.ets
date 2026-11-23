@@ -3,7 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { pushService } from '@kit.PushKit';
-import { ACCENT, APP_FONT, BACKGROUND, FOREGROUND, MUTED, SURFACE } from '../ui/Theme';
+import { nerveColors, NerveColors } from '../ui/Theme';
 
 function tokenFailure(code: number): string {
   switch (code) {
@@ -23,6 +23,7 @@ function tokenFailure(code: number): string {
 
 @Component
 export struct PushSettings {
+  @Prop colors: NerveColors = nerveColors('indigo', false);
   onClose: () => void = () => {};
   @State private allowed: boolean | undefined = undefined;
   @State private permissionRequested: boolean = false;
@@ -128,24 +129,24 @@ export struct PushSettings {
       Column({ space: 14 }) {
         Row({ space: 12 }) {
           Button('返回', { type: ButtonType.Normal })
-            .fontFamily(APP_FONT).fontSize(14).fontColor(FOREGROUND).backgroundColor(SURFACE)
-            .borderRadius(8).height(38).onClick(() => this.onClose())
-          Text('推送通知').fontFamily(APP_FONT).fontSize(22).fontWeight(FontWeight.Bold).fontColor(FOREGROUND)
+           .fontSize(14).fontColor(this.colors.foreground).backgroundColor(this.colors.surface)
+            .borderRadius(12).height(44).onClick(() => this.onClose())
+          Text('推送通知').fontSize(22).fontWeight(FontWeight.Bold).fontColor(this.colors.foreground)
         }.width('100%')
 
         Column({ space: 8 }) {
-          Text('系统通知').fontFamily(APP_FONT).fontSize(16).fontColor(FOREGROUND)
-          Text(this.permissionText).fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
+          Text('系统通知').fontSize(16).fontColor(this.colors.foreground)
+          Text(this.permissionText).fontSize(13).fontColor(this.colors.muted)
           Button(this.allowed || this.permissionRequested ? '通知设置' : '允许通知', { type: ButtonType.Normal })
-            .fontFamily(APP_FONT).fontSize(14).fontColor(FOREGROUND).backgroundColor(BACKGROUND)
+           .fontSize(14).fontColor(this.colors.foreground).backgroundColor(this.colors.background)
             .borderRadius(8).height(42).enabled(!this.busy).onClick(() => this.changePermission())
-        }.width('100%').alignItems(HorizontalAlign.Start).padding(14).borderRadius(12).backgroundColor(SURFACE)
+        }.width('100%').alignItems(HorizontalAlign.Start).padding(14).borderRadius(12).backgroundColor(this.colors.surface)
 
         Column({ space: 8 }) {
-          Text('设备令牌').fontFamily(APP_FONT).fontSize(16).fontColor(FOREGROUND)
-          Text(this.tokenText).fontFamily(APP_FONT).fontSize(13).fontColor(MUTED)
+          Text('设备令牌').fontSize(16).fontColor(this.colors.foreground)
+          Text(this.tokenText).fontSize(13).fontColor(this.colors.muted)
           Button(this.hasToken ? '保存令牌到文件' : '获取令牌', { type: ButtonType.Normal })
-            .fontFamily(APP_FONT).fontSize(14).fontColor(BACKGROUND).backgroundColor(ACCENT)
+           .fontSize(14).fontColor(Color.White).backgroundColor(this.colors.palette.action)
             .borderRadius(8).height(42).enabled(!this.busy).onClick(() => {
               if (this.hasToken) {
                 this.saveToken();
@@ -153,8 +154,8 @@ export struct PushSettings {
                 this.obtainToken();
               }
             })
-        }.width('100%').alignItems(HorizontalAlign.Start).padding(14).borderRadius(12).backgroundColor(SURFACE)
+        }.width('100%').alignItems(HorizontalAlign.Start).padding(14).borderRadius(12).backgroundColor(this.colors.surface)
       }.width('100%').constraintSize({ maxWidth: 540 }).padding(20)
-    }.width('100%').height('100%').align(Alignment.Top).backgroundColor(BACKGROUND)
+    }.width('100%').height('100%').align(Alignment.Top).backgroundColor(this.colors.background)
   }
 }

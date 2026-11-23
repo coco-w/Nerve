@@ -6,6 +6,12 @@ import { readPushLink } from '../push/PushLink';
 const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
+  // 同步软键盘高度，供终端页面控制辅助按键栏的显示状态。
+  private mainWindow: window.Window | undefined;
+  private readonly updateKeyboardHeight = (height: number): void => {
+    AppStorage.setOrCreate<number>('nerveKeyboardHeight', height);
+  };
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     this.receivePushLink(want);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
@@ -39,13 +45,21 @@ export default class EntryAbility extends UIAbility {
 
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+      this.mainWindow = windowStage.getMainWindowSync();
+      this.mainWindow.on('keyboardHeightChange', this.updateKeyboardHeight);
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
     }
   }
 
   onWindowStageDestroy(): void {
-    // Main window is destroyed, release UI related resources
+    try {
+      this.mainWindow?.off('keyboardHeightChange', this.updateKeyboardHeight);
+    } catch (_) {
+      // 窗口可能已销毁，移除监听失败时仍继续清理页面状态。
+    }
+    this.mainWindow = undefined;
+    this.updateKeyboardHeight(0);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageDestroy');
   }
 
