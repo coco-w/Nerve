@@ -319,6 +319,8 @@ void SshSession::OpenMosh(const ConnectOptions &options)
     if (!terminal.empty()) {
         script += " -- /bin/sh -c " + ShellQuote(terminal);
     }
+    // 收集 mosh-server 的启动诊断，只向界面返回已识别的错误，不转发原始输出。
+    script += " 2>&1";
     std::string output;
     const int status = RunCommand("/bin/sh -c " + ShellQuote(script), output,
         SSH_REQUEST_TIMEOUT_MS, MAX_MOSH_START_BYTES);
@@ -326,6 +328,9 @@ void SshSession::OpenMosh(const ConnectOptions &options)
         ClearSecret(output);
         throw std::runtime_error("在开发机的 SSH PATH 中找不到 mosh-server，请安装 Mosh 或选择 SSH。");
     }
+    // 固定端口冲突时，mosh-server 在返回会话票据前就会报告绑定失败。
+    const bool portInUse = status == 1 && options.moshPort > 0 &&
+        output.find("Network exception: bind: Address already in use") != std::string::npos;
     // 官方 mosh-server 的响应给出端口和 16 字节会话密钥的无填充 Base64。
     static const std::regex ticket(R"((^|\n)MOSH CONNECT ([0-9]{1,5}) ([A-Za-z0-9+/]{21}[AQgw])\r?(\n|$))");
     std::smatch match;
@@ -334,6 +339,10 @@ void SshSession::OpenMosh(const ConnectOptions &options)
         moshKey_.assign(match[3].first, match[3].second);
     }
     ClearSecret(output);
+    if (portInUse) {
+        throw std::runtime_error("开发机的 Mosh UDP " + std::to_string(options.moshPort) +
+            " 已被占用。请先释放该端口，再重试。");
+    }
     if (moshKey_.empty() || moshPort_ < 1 || moshPort_ > 65535 ||
         (options.moshPort > 0 && moshPort_ != options.moshPort)) {
         throw std::runtime_error("启动 mosh-server 失败，请检查 UDP 端口和开发机的 UTF-8 环境。");
