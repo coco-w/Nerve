@@ -9,6 +9,7 @@ import { hostIdFromDaemonHealth } from '../push/PushLink';
 import { PushSettings } from '../push/PushSettings';
 import { dialP2p, P2pPairing, parseP2pPairing } from '../ssh/P2pClient';
 import { SavedSshServer, SshCredentials, SshServerSettings, SshServerStore } from '../ssh/SshServerStore';
+import { NerveTerminalMenu, NERVE_TERMINAL_MENU_BACKGROUND } from '../ui/TerminalMenu';
 import { ACCENT, APP_FONT, BACKGROUND, ERROR, FOREGROUND, MUTED, SURFACE } from '../ui/Theme';
 
 // ArkWeb 拦截时使用资源 URL，加载后可能显示为 RAWFILE 格式。
@@ -145,6 +146,8 @@ struct Index {
   @State private hostKeyReview: HostKeyReview | undefined = undefined;
   @State private terminalVisible: boolean = false;
   @State private terminalInstance: number = 0;
+  // 终端菜单独立于首页设置弹层，关闭菜单时保留当前连接。
+  @State private terminalMenuVisible: boolean = false;
   @State private connected: boolean = false;
   @State private closingMosh: boolean = false;
   @State private statusText: string = '';
@@ -211,6 +214,10 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    if (this.terminalMenuVisible) {
+      this.terminalMenuVisible = false;
+      return true;
+    }
     if (this.hostKeyReview) {
       this.cancelHostKeyReview();
       return true;
@@ -926,6 +933,7 @@ struct Index {
   }
 
   private backToForm(): void {
+    this.terminalMenuVisible = false;
     this.stopConnection();
     this.terminalVisible = false;
     this.getUIContext().setKeyboardAvoidMode(this.formKeyboardMode);
@@ -1452,6 +1460,33 @@ struct Index {
   }
 
   @Builder
+  terminalMenuButton(accent: string) {
+    Button({ type: ButtonType.Normal }) {
+      Text('⋯').fontSize(23).fontColor('#f1f1fc')
+    }.width(44).height(44).padding(0).borderRadius(13).backgroundColor(Color.Transparent)
+    .accessibilityText('终端操作').focusOnTouch(false)
+    .onClick(() => { this.terminalMenuVisible = true; })
+    .bindSheet($$this.terminalMenuVisible, this.terminalMenuContent(accent), {
+      height: SheetSize.FIT_CONTENT, dragBar: true, showClose: false,
+      backgroundColor: NERVE_TERMINAL_MENU_BACKGROUND
+    })
+  }
+
+  // 面板直接读取当前会话状态，连接结束或 Mosh 关闭中均能同步更新。
+  @Builder
+  terminalMenuContent(accent: string) {
+    NerveTerminalMenu({
+      sessionTitle: this.openedRemoteTitle, statusText: this.statusText,
+      connected: this.connected, closing: this.closingMosh, accent,
+      onClose: () => { this.terminalMenuVisible = false; },
+      onExit: () => {
+        this.terminalMenuVisible = false;
+        this.closeTerminal(() => this.backToForm());
+      }
+    })
+  }
+
+  @Builder
   terminalView(instance: number) {
     Column() {
       Row({ space: 10 }) {
@@ -1474,11 +1509,7 @@ struct Index {
               }
             })
         }
-        Button(this.connected || this.closingMosh ? '断开' : '返回', { type: ButtonType.Normal })
-          .height(34).borderRadius(8).fontFamily(APP_FONT).fontSize(13)
-          .fontColor(FOREGROUND).backgroundColor(SURFACE)
-          .enabled(!this.closingMosh)
-          .onClick(() => this.closeTerminal(() => this.backToForm()))
+        this.terminalMenuButton(ACCENT)
       }.width('100%').padding({ left: 12, top: 8, right: 12, bottom: 8 })
       Web({ src: $rawfile('terminal/index.html'), controller: this.view })
         .width('100%')
