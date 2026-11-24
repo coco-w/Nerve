@@ -10,7 +10,9 @@ const managedOmpHeader = '// 此扩展由 Nerve Daemon 安装程序管理。\n';
 export function codexHookGroups(command: string) {
   // 自动注册与手动导出使用同一套已支持的 Codex 事件。
   return Object.fromEntries(Object.keys(codexEvents).map(event => [
-    event, [{ hooks: [{ type: 'command', command, timeout: 3 }] }],
+    // 提问 Hook 使用精确匹配，避免每一次普通工具执行都启动适配器。
+    event, [{ ...(event === 'PreToolUse' ? { matcher: '^request_user_input$' } : {}),
+      hooks: [{ type: 'command', command, timeout: 3 }] }],
   ]));
 }
 

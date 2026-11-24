@@ -163,7 +163,9 @@ test('通知在 Gateway 离线时写入待投递队列，双方重启后仅投�
 
   const pushTarget = { url, token };
   daemon = await startDaemon(daemonHome, pushTarget);
-  const selected = [event('codex', 'PermissionRequest'), event('codex', 'Stop'), event('omp', 'agent_end')];
+  const selected = [event('codex', 'PermissionRequest'), event('codex', 'Stop'), event('omp', 'agent_end'),
+    event('codex', 'PreToolUse'), event('omp', 'tool_execution_start'),
+    event('omp', 'tool_approval_requested'), event('omp', 'plan_review_requested')];
   const ignored = event('omp', 'agent_start');
   for (const input of [ignored, ...selected, selected[0]]) {
     const response = await http(daemon.socketPath, '/v1/events', JSON.stringify(input));
@@ -187,7 +189,7 @@ test('通知在 Gateway 离线时写入待投递队列，双方重启后仅投�
   const post = body => fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(2000) });
   assert.equal((await post('{}')).status, 422);
   assert.equal((await post(' '.repeat(4097))).status, 413);
-  await until(async () => (await http(daemon.socketPath, '/v1/push/status')).body.sent === 3,
+  await until(async () => (await http(daemon.socketPath, '/v1/push/status')).body.sent === selected.length,
     '重启 Daemon 后应将已入库的通知送达 Gateway');
   const receipts = queueRows(gatewayDb);
   assert.equal(receipts.length, selected.length);
@@ -201,7 +203,7 @@ test('通知在 Gateway 离线时写入待投递队列，双方重启后仅投�
   const first = payloads[0];
   assert.equal((await post(JSON.stringify({ ...first, cwd: '/untrusted' }))).status, 200);
   assert.equal((await post(JSON.stringify({ ...first, occurredAt: first.occurredAt + 1 }))).status, 409);
-  assert.equal((await http(daemon.socketPath, '/v1/events')).body.events.length, 5);
+  assert.equal((await http(daemon.socketPath, '/v1/events')).body.events.length, selected.length + 2);
 
   await close(gateway);
   const attempts = new Map();

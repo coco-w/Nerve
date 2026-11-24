@@ -5,6 +5,7 @@ export const codexEvents = {
   SessionStart: 'agent.session.started',
   UserPromptSubmit: 'agent.task.started',
   PermissionRequest: 'agent.permission.required',
+  PreToolUse: 'agent.input.required',
   Stop: 'agent.turn.stopped',
   SessionEnd: 'agent.session.ended',
 } as const;
@@ -13,6 +14,9 @@ export const ompEvents = {
   session_start: 'agent.session.started',
   agent_start: 'agent.task.started',
   agent_end: 'agent.task.ended',
+  tool_execution_start: 'agent.input.required',
+  tool_approval_requested: 'agent.permission.required',
+  plan_review_requested: 'agent.input.required',
   session_shutdown: 'agent.session.ended',
 } as const;
 
@@ -121,5 +125,15 @@ export function createAgentEvent(
 
 export function fromCodexHook(input: unknown, env = process.env): AgentEvent | undefined {
   if (!isRecord(input) || typeof input.hook_event_name !== 'string') return;
+  // 仅提问工具表示等待输入，普通工具调用不入库，也不转发问题或选项内容。
+  if (input.hook_event_name === 'PreToolUse' && input.tool_name !== 'request_user_input') return;
   return createAgentEvent('codex', input.hook_event_name, input.session_id, input.cwd, input.turn_id, env);
+}
+
+// OMP 工具开始事件只筛选内置 ask；权限审批和计划选择使用各自的原生事件。
+export function fromOmpEvent(input: unknown, sessionId: unknown, cwd: unknown,
+  env = process.env): AgentEvent | undefined {
+  if (!isRecord(input) || typeof input.type !== 'string') return;
+  if (input.type === 'tool_execution_start' && input.toolName !== 'ask') return;
+  return createAgentEvent('omp', input.type, sessionId, cwd, undefined, env);
 }

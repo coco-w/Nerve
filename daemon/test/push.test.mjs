@@ -186,4 +186,23 @@ test('Huawei V3 请求使用可验签的 PS256、稳定消息标识和官方响�
   assert.deepEqual(first.body.target.token, ['device-token-fixture']);
   assert.equal(first.body.pushOptions.testMessage, true);
   assert.doesNotMatch(JSON.stringify(first.body), /private|service-account/);
+
+  // 各类原生等待事件生成对应锁屏文案，定位字段沿用现有通知点击协议。
+  const alerts = [];
+  const deliverAlert = deliverToHuawei(config, async (_url, request) => {
+    alerts.push(JSON.parse(request.body).payload.notification);
+    return Response.json({ code: '80000000' });
+  });
+  for (const [agent, nativeEvent] of [['codex', 'PreToolUse'], ['omp', 'tool_execution_start'],
+    ['omp', 'plan_review_requested'], ['omp', 'tool_approval_requested'], ['omp', 'agent_end']]) {
+    const input = notificationFromEvent(notification.hostId,
+      createAgentEvent(agent, nativeEvent, 'private', '/private/work', undefined, {}));
+    assert.deepEqual(await deliverAlert(input, signal), { state: 'sent' });
+    const alert = alerts.at(-1);
+    const expected = input.eventType === 'agent.input.required' ? '等待你的回答或选择。'
+      : input.eventType === 'agent.permission.required' ? '请求权限，等待你的处理。' : '本轮运行已结束。';
+    assert.equal(alert.body, expected);
+    assert.deepEqual(alert.clickAction.data, { hostId: input.hostId, eventId: input.eventId });
+    assert.doesNotMatch(JSON.stringify(alert), /private/);
+  }
 });

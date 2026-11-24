@@ -1,7 +1,8 @@
 import { codexEvents, isRecord, ompEvents, uuidPattern } from './agent.js';
 import type { AgentEvent } from './agent.js';
 
-type NotificationEventType = typeof codexEvents.PermissionRequest | typeof codexEvents.Stop | typeof ompEvents.agent_end;
+type NotificationEventType = typeof codexEvents.PermissionRequest | typeof codexEvents.Stop
+  | typeof codexEvents.PreToolUse | typeof ompEvents.agent_end;
 
 // 这是出主机的通知协议。工作路径、Agent 对话和 Zellij 会话名留在本机。
 export interface PushNotification {
@@ -14,8 +15,10 @@ export interface PushNotification {
 }
 
 function isNotifiable(agent: unknown, type: unknown): type is NotificationEventType {
-  return (agent === 'codex' && (type === codexEvents.PermissionRequest || type === codexEvents.Stop))
-    || (agent === 'omp' && type === ompEvents.agent_end);
+  return (agent === 'codex' && (type === codexEvents.PermissionRequest || type === codexEvents.Stop
+    || type === codexEvents.PreToolUse))
+    || (agent === 'omp' && (type === ompEvents.agent_end || type === ompEvents.tool_approval_requested
+      || type === ompEvents.tool_execution_start));
 }
 
 export function notificationFromEvent(hostId: string, event: AgentEvent): PushNotification | undefined {

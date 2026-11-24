@@ -54,7 +54,8 @@ try {
   assert.match(install(), /已配置 Codex[\s\S]*已配置 OMP/);
   const merged = await readFile(hooksFile, 'utf8');
   const loaded = JSON.parse(merged);
-  assert.deepEqual(loaded, { ...original, hooks: { ...generated, ...original.hooks } });
+  assert.deepEqual(loaded, { ...original, hooks: { ...generated, ...original.hooks,
+    PreToolUse: [userGroup, ...generated.PreToolUse] } });
   const extension = await readFile(extensionPath, 'utf8');
   assert.ok(extension.endsWith(run('omp-extension')));
   assert.equal(await readFile(otherExtension, 'utf8'), otherExtensionContent);

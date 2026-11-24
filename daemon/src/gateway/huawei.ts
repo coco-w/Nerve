@@ -96,7 +96,9 @@ export function deliverToHuawei(config: HuaweiConfig, send: typeof fetch = fetch
           notification: {
             category: config.category,
             title: 'Nerve · ' + agentName,
-            body: eventType === 'agent.permission.required' ? '请求权限，等待你的处理。' : '本轮运行已结束。',
+            // 锁屏只显示等待原因，问题、选项和工具参数仍留在开发机。
+            body: eventType === 'agent.permission.required' ? '请求权限，等待你的处理。'
+              : eventType === 'agent.input.required' ? '等待你的回答或选择。' : '本轮运行已结束。',
             appMessageId,
             clickAction: { actionType: 0, data: { hostId, eventId } },
           },
